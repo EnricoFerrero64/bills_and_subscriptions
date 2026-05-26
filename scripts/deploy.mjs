@@ -10,7 +10,7 @@ import {
 import { join } from "path";
 import { homedir } from "os";
 
-const ADDON_ID = "subscription-stack";
+const ADDON_ID = "bills-and-subscriptions";
 const WEALTHFOLIO_ADDONS = join(
   homedir(),
   "AppData",
@@ -38,7 +38,7 @@ function deploy() {
   let addonJs = readFileSync(addonJsPath, "utf-8");
 
   // Inline the generated CSS with scoping so Wealthfolio only needs to load addon.js
-  const cssFiles = ["subscription-stack.css"];
+  const cssFiles = ["bills-and-subscriptions.css"];
   for (const cssFile of cssFiles) {
     const cssPath = join(PROJECT_ROOT, "dist", cssFile);
     if (existsSync(cssPath)) {
@@ -52,7 +52,7 @@ function deploy() {
       const bodyOnly = cssContent.replace(rootBlockRe, "");
 
       const globalCss = rootBlocks.join("\n");
-      const scopedCss = `${globalCss}\n@scope (.subscription-stack-root) {\n${bodyOnly}\n}`;
+      const scopedCss = `${globalCss}\n@scope (.bills-and-subscriptions-root) {\n${bodyOnly}\n}`;
       const injection = `(function(){var s=document.createElement('style');s.textContent=${JSON.stringify(scopedCss)};document.head.appendChild(s);})();\n`;
       addonJs = injection + addonJs;
       console.log(`   Inlined ${cssFile} (${(cssContent.length / 1024).toFixed(1)} kB)`);

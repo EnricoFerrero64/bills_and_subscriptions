@@ -16,7 +16,7 @@ import {
   formatCurrency,
 } from "../lib/storage";
 
-const CURRENT_PATH = "/addons/subscription-stack";
+const CURRENT_PATH = "/addons/bills-and-subscriptions";
 
 type FormState = SubFormState;
 

@@ -1,7 +1,7 @@
 {
-  "name": "subscription-stack",
+  "name": "bills-and-subscriptions",
   "version": "1.0.0",
-  "description": "Track all your subscriptions and see your monthly/yearly spend at a glance",
+  "description": "Track all your bills and subscriptions and see your monthly/yearly spend at a glance",
   "type": "module",
   "main": "dist/addon.js",
   "author": "Baykenn",

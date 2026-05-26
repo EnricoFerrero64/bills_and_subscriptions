@@ -11,25 +11,25 @@ export default function enable(ctx: AddonContext) {
   setContext(ctx);
 
   const sidebarItem = ctx.sidebar.addItem({
-    id: "subscription-stack",
+    id: "bills-and-subscriptions",
     label: "Subscriptions & Bills",
     icon: <Layers className="h-5 w-5" />,
-    route: "/addons/subscription-stack/summary",
+    route: "/addons/bills-and-subscriptions/summary",
     order: 400,
   });
 
   ctx.router.add({
-    path: "/addons/subscription-stack",
+    path: "/addons/bills-and-subscriptions",
     component: React.lazy(() => Promise.resolve({ default: SubscriptionsPage })),
   });
 
   ctx.router.add({
-    path: "/addons/subscription-stack/summary",
+    path: "/addons/bills-and-subscriptions/summary",
     component: React.lazy(() => Promise.resolve({ default: SummaryPage })),
   });
 
   ctx.router.add({
-    path: "/addons/subscription-stack/bills",
+    path: "/addons/bills-and-subscriptions/bills",
     component: React.lazy(() => Promise.resolve({ default: BillsPage })),
   });
 
