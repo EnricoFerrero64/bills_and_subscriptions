@@ -5,15 +5,16 @@ import type { AddonContext } from "@wealthfolio/addon-sdk";
 import { setContext } from "./context";
 import { SubscriptionsPage } from "./pages/SubscriptionsPage";
 import { SummaryPage } from "./pages/SummaryPage";
+import { BillsPage } from "./pages/BillsPage";
 
 export default function enable(ctx: AddonContext) {
   setContext(ctx);
 
   const sidebarItem = ctx.sidebar.addItem({
     id: "subscription-stack",
-    label: "Subscription Stack",
+    label: "Subscriptions & Bills",
     icon: <Layers className="h-5 w-5" />,
-    route: "/addons/subscription-stack",
+    route: "/addons/subscription-stack/summary",
     order: 400,
   });
 
@@ -25,6 +26,11 @@ export default function enable(ctx: AddonContext) {
   ctx.router.add({
     path: "/addons/subscription-stack/summary",
     component: React.lazy(() => Promise.resolve({ default: SummaryPage })),
+  });
+
+  ctx.router.add({
+    path: "/addons/subscription-stack/bills",
+    component: React.lazy(() => Promise.resolve({ default: BillsPage })),
   });
 
   ctx.onDisable(() => {

@@ -43,7 +43,16 @@ function deploy() {
     const cssPath = join(PROJECT_ROOT, "dist", cssFile);
     if (existsSync(cssPath)) {
       const cssContent = readFileSync(cssPath, "utf-8");
-      const scopedCss = `@scope (.subscription-stack-root) {\n${cssContent}\n}`;
+
+      // :root / :host blocks define CSS custom properties (e.g. --radius-xl, --color-*).
+      // They must live outside @scope — otherwise the scope anchor can never match :root
+      // and all var() references inside the addon silently resolve to nothing.
+      const rootBlockRe = /(?::root|:host)(?:\s*,\s*(?::root|:host))*\s*\{[^}]*\}/g;
+      const rootBlocks = cssContent.match(rootBlockRe) ?? [];
+      const bodyOnly = cssContent.replace(rootBlockRe, "");
+
+      const globalCss = rootBlocks.join("\n");
+      const scopedCss = `${globalCss}\n@scope (.subscription-stack-root) {\n${bodyOnly}\n}`;
       const injection = `(function(){var s=document.createElement('style');s.textContent=${JSON.stringify(scopedCss)};document.head.appendChild(s);})();\n`;
       addonJs = injection + addonJs;
       console.log(`   Inlined ${cssFile} (${(cssContent.length / 1024).toFixed(1)} kB)`);

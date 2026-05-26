@@ -13,6 +13,7 @@ export const CATEGORIES = [
   "Cloud & Storage",
   "Communication",
   "Shopping",
+  "Utilities",
   "Other",
 ] as const;
 
@@ -32,7 +33,8 @@ export interface Subscription {
   currency: Currency;
   billingCycle: BillingCycle;
   category: SubscriptionCategory;
-  startDate?: string; // ISO date string
+  website?: string;    // optional — used to auto-fetch favicon
+  startDate?: string;  // ISO date string
   notes?: string;
   active: boolean;
 }
@@ -44,18 +46,117 @@ export const CYCLE_LABELS: Record<BillingCycle, string> = {
   weekly: "/ wk",
 };
 
+// Category colors — one distinct hue per category, no hue family repeated more than once.
 export const CATEGORY_COLORS: Record<SubscriptionCategory, { bg: string; color: string }> = {
-  "Entertainment":  { bg: "#3b0764", color: "#d8b4fe" },
-  "Productivity":   { bg: "#1e3a5f", color: "#93c5fd" },
-  "Health & Fitness": { bg: "#14532d", color: "#86efac" },
-  "Finance":        { bg: "#713f12", color: "#fde68a" },
-  "News & Media":   { bg: "#7c2d12", color: "#fdba74" },
-  "Education":      { bg: "#134e4a", color: "#5eead4" },
-  "Cloud & Storage":{ bg: "#164e63", color: "#67e8f9" },
-  "Communication":  { bg: "#500724", color: "#fbcfe8" },
-  "Shopping":       { bg: "#4a044e", color: "#f0abfc" },
-  "Other":          { bg: "#1f2937", color: "#9ca3af" },
+  "Entertainment":    { bg: "rgba(148,97,212,0.15)",  color: "#9461d4" },  // purple
+  "Productivity":     { bg: "rgba(77,125,204,0.15)",  color: "#4d7dcc" },  // blue
+  "Health & Fitness": { bg: "rgba(54,161,93,0.15)",   color: "#36a15d" },  // green
+  "Finance":          { bg: "rgba(181,128,38,0.15)",  color: "#b58026" },  // amber
+  "News & Media":     { bg: "rgba(198,83,133,0.15)",  color: "#c65385" },  // rose
+  "Education":        { bg: "rgba(59,176,164,0.15)",  color: "#3bb0a4" },  // teal
+  "Cloud & Storage":  { bg: "rgba(114,140,53,0.15)",  color: "#728c35" },  // olive
+  "Communication":    { bg: "rgba(91,92,200,0.15)",   color: "#5b5cc8" },  // indigo
+  "Shopping":         { bg: "rgba(175,140,44,0.15)",  color: "#af8c2c" },  // gold
+  "Utilities":        { bg: "rgba(210,114,45,0.15)",  color: "#d2722d" },  // orange
+  "Other":            { bg: "rgba(128,149,179,0.12)", color: "#8095b3" },  // slate
 };
+
+// ─── Bills ────────────────────────────────────────────────────────────────────
+
+export const BILL_CATEGORIES = [
+  "Electricity",
+  "Water",
+  "Gas",
+  "Internet",
+  "Phone",
+  "Rent",
+  "Insurance",
+  "Other",
+] as const;
+
+export type BillCategory = (typeof BILL_CATEGORIES)[number];
+
+export const BILL_CATEGORY_COLORS: Record<BillCategory, { bg: string; color: string }> = {
+  "Electricity": { bg: "rgba(175,140,44,0.15)",  color: "#af8c2c" },  // gold
+  "Water":       { bg: "rgba(59,176,164,0.15)",  color: "#3bb0a4" },  // teal
+  "Gas":         { bg: "rgba(210,114,45,0.15)",  color: "#d2722d" },  // orange
+  "Internet":    { bg: "rgba(91,92,200,0.15)",   color: "#5b5cc8" },  // indigo
+  "Phone":       { bg: "rgba(198,83,133,0.15)",  color: "#c65385" },  // rose
+  "Rent":        { bg: "rgba(200,64,64,0.15)",   color: "#c84040" },  // red
+  "Insurance":   { bg: "rgba(54,161,93,0.15)",   color: "#36a15d" },  // green
+  "Other":       { bg: "rgba(128,149,179,0.12)", color: "#8095b3" },  // slate
+};
+
+export interface Bill {
+  id: string;
+  name: string;
+  amount: number;
+  currency: Currency;
+  category: BillCategory;
+  date: string;   // ISO date — when the bill arrived / is due
+  website?: string;
+  notes?: string;
+  paid: boolean;
+  recurring: boolean;
+  billingCycle?: BillingCycle; // only meaningful when recurring === true
+}
+
+const BILLS_KEY = "ss:bills";
+
+export function getBills(): Bill[] {
+  return load<Bill>(BILLS_KEY);
+}
+
+export function saveBill(bill: Bill): void {
+  const all = load<Bill>(BILLS_KEY);
+  const idx = all.findIndex((b) => b.id === bill.id);
+  if (idx >= 0) {
+    all[idx] = bill;
+  } else {
+    all.unshift(bill);
+  }
+  save(BILLS_KEY, all);
+}
+
+export function deleteBill(id: string): void {
+  save(BILLS_KEY, load<Bill>(BILLS_KEY).filter((b) => b.id !== id));
+}
+
+// ─── Addon settings ───────────────────────────────────────────────────────────
+
+export interface AddonSettings {
+  billsEnabled: boolean;
+}
+
+const SETTINGS_KEY = "ss:settings";
+const DEFAULT_SETTINGS: AddonSettings = { billsEnabled: true };
+
+export function getSettings(): AddonSettings {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (!raw) return { ...DEFAULT_SETTINGS };
+    return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+  } catch {
+    return { ...DEFAULT_SETTINGS };
+  }
+}
+
+export function saveSettings(settings: AddonSettings): void {
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  window.dispatchEvent(new CustomEvent("ss:settings-changed"));
+}
+
+// ─── Shared helpers ───────────────────────────────────────────────────────────
+
+/** Extract a clean hostname from a website string entered by the user. */
+export function extractDomain(website: string): string {
+  try {
+    const url = website.startsWith("http") ? website : `https://${website}`;
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return website.replace(/^www\./, "");
+  }
+}
 
 /** Convert any billing cycle amount to its monthly equivalent. */
 export function toMonthly(amount: number, cycle: BillingCycle): number {
@@ -75,6 +176,18 @@ export function toYearly(amount: number, cycle: BillingCycle): number {
     case "quarterly": return amount * 4;
     case "yearly":    return amount;
   }
+}
+
+/** Advance an ISO date string by one billing cycle. */
+export function advanceDateByCycle(dateStr: string, cycle: BillingCycle): string {
+  const d = new Date(dateStr);
+  switch (cycle) {
+    case "weekly":    d.setDate(d.getDate() + 7); break;
+    case "monthly":   d.setMonth(d.getMonth() + 1); break;
+    case "quarterly": d.setMonth(d.getMonth() + 3); break;
+    case "yearly":    d.setFullYear(d.getFullYear() + 1); break;
+  }
+  return d.toISOString().slice(0, 10);
 }
 
 export function formatCurrency(amount: number, currency: string): string {

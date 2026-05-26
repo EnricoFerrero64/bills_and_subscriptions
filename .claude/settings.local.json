@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"E:\\Projects\\Apps\\Claude_Dashboard\\experiments\\approval-bridge\\bridge.mjs\" 64140"
+            "command": "node \"E:\\Projects\\Apps\\Claude_Dashboard\\experiments\\approval-bridge\\bridge.mjs\" 49652"
           }
         ]
       }
