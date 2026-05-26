@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { getContext } from "../context";
-import type { Currency } from "./storage";
+import { CURRENCIES, type Currency } from "./storage";
 
 const FALLBACK: Currency = "USD";
 
@@ -11,7 +11,9 @@ export function useBaseCurrency(): Currency {
     getContext()
       .api.settings.get()
       .then((s) => {
-        if (s.baseCurrency) setCurrency(s.baseCurrency as Currency);
+        if (s.baseCurrency && (CURRENCIES as readonly string[]).includes(s.baseCurrency)) {
+          setCurrency(s.baseCurrency as Currency);
+        }
       })
       .catch(() => {});
   }, []);

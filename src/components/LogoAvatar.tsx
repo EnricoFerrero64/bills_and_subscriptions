@@ -16,7 +16,7 @@ export function LogoAvatar({ name, website, colors, size = "md" }: LogoAvatarPro
 
   const domain     = website ? extractDomain(website) : null;
   const faviconUrl = domain
-    ? `https://t2.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=https://${domain}&size=128`
+    ? `https://t2.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=${encodeURIComponent(`https://${domain}`)}&size=128`
     : null;
 
   if (faviconUrl && !imgError) {

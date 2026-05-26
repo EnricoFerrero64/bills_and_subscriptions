@@ -12,9 +12,9 @@ interface Tab {
 }
 
 const ALL_TABS: Tab[] = [
-  { label: "Summary",       path: "/addons/subscription-stack/summary", icon: <BarChart2  className="h-3.5 w-3.5" /> },
-  { label: "Subscriptions", path: "/addons/subscription-stack",         icon: <CreditCard className="h-3.5 w-3.5" /> },
-  { label: "Bills",         path: "/addons/subscription-stack/bills",   icon: <Receipt    className="h-3.5 w-3.5" />, settingKey: "billsEnabled" },
+  { label: "Summary",       path: "/addons/bills-and-subscriptions/summary", icon: <BarChart2  className="h-3.5 w-3.5" /> },
+  { label: "Subscriptions", path: "/addons/bills-and-subscriptions",         icon: <CreditCard className="h-3.5 w-3.5" /> },
+  { label: "Bills",         path: "/addons/bills-and-subscriptions/bills",   icon: <Receipt    className="h-3.5 w-3.5" />, settingKey: "billsEnabled" },
 ];
 
 interface PageLayoutProps {
@@ -50,8 +50,7 @@ export function PageLayout({ children, activePath }: PageLayoutProps) {
     requestAnimationFrame(() => {
       requestAnimationFrame(() => setAnimated(true));
     });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [activePath, measureTab]);
 
   const handleTabClick = (tab: Tab) => {
     if (tab.path === activePath) return;
@@ -66,13 +65,13 @@ export function PageLayout({ children, activePath }: PageLayoutProps) {
     setSettings(next);
 
     // If we just disabled the active tab's feature, navigate away
-    if (key === "billsEnabled" && !next.billsEnabled && activePath === "/addons/subscription-stack/bills") {
-      ctx.api.navigation.navigate("/addons/subscription-stack/summary");
+    if (key === "billsEnabled" && !next.billsEnabled && activePath === "/addons/bills-and-subscriptions/bills") {
+      ctx.api.navigation.navigate("/addons/bills-and-subscriptions/summary");
     }
   };
 
   return (
-    <div className="subscription-stack-root flex flex-col min-h-screen bg-background text-foreground">
+    <div className="bills-and-subscriptions-root flex flex-col min-h-screen bg-background text-foreground">
 
       {/* Header */}
       <div className="px-4 pt-4 pb-3 flex flex-col gap-3 border-b border-border">

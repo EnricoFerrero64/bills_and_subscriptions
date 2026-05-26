@@ -19,7 +19,7 @@ import {
   advanceDateByCycle,
 } from "../lib/storage";
 
-const CURRENT_PATH = "/addons/subscription-stack/bills";
+const CURRENT_PATH = "/addons/bills-and-subscriptions/bills";
 
 const BILL_CYCLES: { value: BillingCycle; label: string }[] = [
   { value: "monthly",   label: "Monthly" },
@@ -309,19 +309,26 @@ export function BillsPage() {
 
     // If recurring and just marked as paid, auto-create the next occurrence
     if (markingPaid && bill.recurring && bill.billingCycle) {
-      saveBill({
-        id: generateId(),
-        name: bill.name,
-        amount: bill.amount,
-        currency: bill.currency,
-        category: bill.category,
-        date: advanceDateByCycle(bill.date, bill.billingCycle),
-        website: bill.website,
-        notes: bill.notes,
-        paid: false,
-        recurring: true,
-        billingCycle: bill.billingCycle,
-      });
+      const nextDate = advanceDateByCycle(bill.date, bill.billingCycle);
+      // Guard: skip if an unpaid occurrence with the same name already exists on that date
+      const alreadyExists = getBills().some(
+        (b) => b.name === bill.name && b.date === nextDate && !b.paid,
+      );
+      if (!alreadyExists) {
+        saveBill({
+          id: generateId(),
+          name: bill.name,
+          amount: bill.amount,
+          currency: bill.currency,
+          category: bill.category,
+          date: nextDate,
+          website: bill.website,
+          notes: bill.notes,
+          paid: false,
+          recurring: true,
+          billingCycle: bill.billingCycle,
+        });
+      }
     }
 
     refresh();
@@ -350,9 +357,14 @@ export function BillsPage() {
   // Current month banner stats
   const currentMonth = monthLabel(today());
   const currentMonthBills = grouped.find((g) => g.month === currentMonth)?.items ?? [];
-  const currentTotal = currentMonthBills.reduce((sum, b) => sum + b.amount, 0);
-  const currentCurrency = currentMonthBills[0]?.currency ?? "EUR";
   const unpaidCount = currentMonthBills.filter((b) => !b.paid).length;
+
+  // Group current-month totals by currency so mixed-currency bills are shown correctly
+  const currentByCurrency = currentMonthBills.reduce<Record<string, number>>((acc, b) => {
+    acc[b.currency] = (acc[b.currency] ?? 0) + b.amount;
+    return acc;
+  }, {});
+  const currentCurrencies = Object.keys(currentByCurrency);
 
   return (
     <PageLayout activePath={CURRENT_PATH}>
@@ -376,9 +388,19 @@ export function BillsPage() {
             <div className="flex items-center gap-6">
               <div className="flex flex-col gap-0.5">
                 <span className="text-xs text-muted-foreground">This month</span>
-                <span className="text-4xl font-bold text-foreground tabular-nums">
-                  {formatCurrency(currentTotal, currentCurrency)}
-                </span>
+                {currentCurrencies.length === 1 ? (
+                  <span className="text-4xl font-bold text-foreground tabular-nums">
+                    {formatCurrency(currentByCurrency[currentCurrencies[0]], currentCurrencies[0])}
+                  </span>
+                ) : (
+                  <div className="flex flex-wrap gap-3">
+                    {currentCurrencies.map((cur) => (
+                      <span key={cur} className="text-2xl font-bold text-foreground tabular-nums">
+                        {formatCurrency(currentByCurrency[cur], cur)}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
               <div className="w-px bg-border self-stretch" />
               <div className="flex flex-col gap-0.5">
@@ -411,8 +433,11 @@ export function BillsPage() {
         {/* Grouped list */}
         {grouped.map(({ month, items }) => {
           const isOpen = !collapsedMonths.has(month);
-          const monthTotal = items.reduce((sum, b) => sum + b.amount, 0);
-          const cur = items[0]?.currency ?? "EUR";
+          const monthByCurrency = items.reduce<Record<string, number>>((acc, b) => {
+            acc[b.currency] = (acc[b.currency] ?? 0) + b.amount;
+            return acc;
+          }, {});
+          const monthCurrencies = Object.keys(monthByCurrency);
 
           return (
             <div key={month} className="flex flex-col gap-1.5">
@@ -427,7 +452,9 @@ export function BillsPage() {
                 />
                 <span>{month}</span>
                 <span className="flex-1" />
-                <span className="tabular-nums">{formatCurrency(monthTotal, cur)}</span>
+                <span className="tabular-nums">
+                  {monthCurrencies.map((cur) => formatCurrency(monthByCurrency[cur], cur)).join(" + ")}
+                </span>
               </button>
 
               {/* Animated rows */}

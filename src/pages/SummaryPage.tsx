@@ -22,7 +22,7 @@ import {
 import { useBaseCurrency } from "../lib/useBaseCurrency";
 import { SubForm, blankSubForm, type SubFormState } from "../components/SubForm";
 
-const CURRENT_PATH = "/addons/subscription-stack/summary";
+const CURRENT_PATH = "/addons/bills-and-subscriptions/summary";
 
 interface SubCategoryTotal {
   category: SubscriptionCategory;
@@ -180,7 +180,7 @@ export function SummaryPage() {
   const combinedCurrency   = primaryCurrency;
   const combinedMonthly    = grandMonthly + billMonthlyAvg;
   const combinedYearly     = grandYearly + billMonthlyAvg * 12;
-  const currenciesMismatch = hasBills && billPrimaryCur !== primaryCurrency && primaryCurrency !== "USD";
+  const currenciesMismatch = hasBills && billPrimaryCur !== primaryCurrency;
 
   if (!hasSubscriptions && !hasBills) {
     return (
