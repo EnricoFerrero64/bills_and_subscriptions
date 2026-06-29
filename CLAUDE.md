@@ -19,6 +19,7 @@ src/
   context.ts          # Singleton AddonContext holder
   lib/
     storage.ts        # Data model, CRUD, currency/cycle helpers
+    sync.ts           # Wealthfolio Sync — pushes charges as withdrawal activities
   pages/
     SubscriptionsPage.tsx  # Main CRUD list with add/edit modal
     SummaryPage.tsx        # Stat cards, category breakdown, top-5
@@ -59,19 +60,3 @@ npm run type-check     # tsc --noEmit only
 | startDate | string? | ISO date, optional |
 | notes | string? | Optional |
 | active | boolean | false = paused |
-
-## Claude Dashboard — Task Inbox
-
-You can create Kanban cards on the Claude Dashboard by writing a JSON file to:
-`.dashboard/inbox/<anything>.json`
-
-```json
-{
-  "title": "Task title (required)",
-  "description": "Optional description",
-  "column": "backlog | in-progress | done  (defaults to backlog)",
-  "tags": ["optional", "tags"]
-}
-```
-
-The dashboard picks it up, creates the card, then deletes the file automatically.
