@@ -14,6 +14,7 @@ export interface SubFormState {
   currency: Currency;
   billingCycle: BillingCycle;
   category: SubscriptionCategory;
+  startDate: string;
   website: string;
   notes: string;
   active: boolean;
@@ -26,6 +27,7 @@ export function blankSubForm(currency: Currency = "USD"): SubFormState {
     currency,
     billingCycle: "monthly",
     category: "Other",
+    startDate: "",
     website: "",
     notes: "",
     active: true,
@@ -119,6 +121,19 @@ export function SubForm({ initial, editingId, onSave, onDelete, onClose }: SubFo
               </button>
             ))}
           </div>
+        </div>
+
+        {/* Start date */}
+        <div className="flex flex-col gap-1.5">
+          <label className="text-xs text-muted-foreground">
+            Start date <span className="text-muted-foreground/50">(optional — required for sync)</span>
+          </label>
+          <input
+            type="date"
+            value={form.startDate}
+            onChange={(e) => set("startDate", e.target.value)}
+            className="bg-background border border-border rounded-xl px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+          />
         </div>
 
         {/* Category */}

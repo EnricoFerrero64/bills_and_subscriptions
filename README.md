@@ -4,9 +4,10 @@ A [Wealthfolio](https://wealthfolio.app) addon that tracks your recurring subscr
 
 ## Features
 
-- **Subscriptions tab** — add, edit, pause, or delete recurring services (Netflix, Spotify, etc.)
+- **Subscriptions tab** — add, edit, pause, or delete recurring services (Netflix, Spotify, etc.); set a start date to track full billing history
 - **Bills tab** — track irregular bills (electricity, water, rent) grouped by month; mark them paid with one click; recurring bills auto-generate the next occurrence when marked paid
 - **Summary tab** — combined monthly/yearly spend card, category breakdowns with progress bars, and a 6-month bill history chart with cumulative line
+- **Wealthfolio Sync** — optionally push all subscription and bill charges to any Wealthfolio cash account as withdrawal transactions; fully idempotent, safe to run multiple times
 - **Multi-currency** — 20 supported currencies, shown separately (no forced conversion)
 - **Favicon logos** — enter a website URL and the addon fetches the service's icon automatically
 - **Offline-first** — all data lives in `localStorage`; no server, no account required
@@ -43,6 +44,7 @@ src/
   context.ts                  # AddonContext singleton
   lib/
     storage.ts                # Data model, CRUD, currency helpers
+    sync.ts                   # Wealthfolio Sync — pushes charges as withdrawal activities
     useBaseCurrency.ts        # Hook to read Wealthfolio's base currency
   pages/
     SubscriptionsPage.tsx     # Subscriptions list + add/edit modal

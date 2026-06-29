@@ -126,10 +126,11 @@ export function deleteBill(id: string): void {
 
 export interface AddonSettings {
   billsEnabled: boolean;
+  syncAccountId: string | null; // null = sync disabled
 }
 
 const SETTINGS_KEY = "ss:settings";
-const DEFAULT_SETTINGS: AddonSettings = { billsEnabled: true };
+const DEFAULT_SETTINGS: AddonSettings = { billsEnabled: true, syncAccountId: null };
 
 export function getSettings(): AddonSettings {
   try {
@@ -144,6 +145,32 @@ export function getSettings(): AddonSettings {
 export function saveSettings(settings: AddonSettings): void {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
   window.dispatchEvent(new CustomEvent("ss:settings-changed"));
+}
+
+// ─── Sync log ─────────────────────────────────────────────────────────────────
+// Maps "${subId}:${date}" → activityId so we never push the same charge twice.
+
+const SYNC_LOG_KEY = "ss:sync-log";
+
+export function getSyncLog(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(SYNC_LOG_KEY);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, string>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+export function updateSyncLog(entries: Record<string, string>): void {
+  localStorage.setItem(SYNC_LOG_KEY, JSON.stringify({ ...getSyncLog(), ...entries }));
+}
+
+export function getSyncLogCount(): number {
+  return Object.keys(getSyncLog()).length;
 }
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
