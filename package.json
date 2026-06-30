@@ -9,6 +9,7 @@
   "scripts": {
     "build": "vite build",
     "ship": "vite build && node scripts/deploy.mjs",
+    "package": "node scripts/package-zip.mjs",
     "dev:deploy": "concurrently \"npm run dev\" \"npm run watch:deploy\"",
     "watch:deploy": "node scripts/watch-deploy.mjs",
     "type-check": "tsc --noEmit"
