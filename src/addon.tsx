@@ -6,6 +6,8 @@ import { setContext } from "./context";
 import { SubscriptionsPage } from "./pages/SubscriptionsPage";
 import { SummaryPage } from "./pages/SummaryPage";
 import { BillsPage } from "./pages/BillsPage";
+import { BillLinkingSuggestionsPage } from "./pages/BillLinkingSuggestionsPage";
+import { BillLinkingLinksPage } from "./pages/BillLinkingLinksPage";
 
 export default function enable(ctx: AddonContext) {
   setContext(ctx);
@@ -31,6 +33,16 @@ export default function enable(ctx: AddonContext) {
   ctx.router.add({
     path: "/addons/bills-and-subscriptions/bills",
     component: React.lazy(() => Promise.resolve({ default: BillsPage })),
+  });
+
+  // Bill Linking routes
+  ctx.router.add({
+    path: "/addons/bills-and-subscriptions/bill-linking",
+    component: React.lazy(() => Promise.resolve({ default: BillLinkingSuggestionsPage })),
+  });
+  ctx.router.add({
+    path: "/addons/bills-and-subscriptions/bill-linking/links",
+    component: React.lazy(() => Promise.resolve({ default: BillLinkingLinksPage })),
   });
 
   ctx.onDisable(() => {
