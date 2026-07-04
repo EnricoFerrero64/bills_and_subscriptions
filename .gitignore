@@ -1,0 +1,42 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+releases/
+.staging/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# OS
+.DS_Store
+Thumbs.db
+
+# TypeScript
+*.tsbuildinfo
+
+# Dashboard (local tooling only)
+.dashboard/
+
+# Claude Code local settings (machine-specific hooks)
+.claude/settings.local.json
+
+# Developer-only files — kept locally, not for public repo
+CLAUDE.md
+ROADMAP.md
+docs/

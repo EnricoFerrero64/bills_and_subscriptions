@@ -1,0 +1,26 @@
+{
+  "id": "bills-and-subscriptions",
+  "name": "Bills & Subscriptions",
+  "version": "1.0.0",
+  "description": "Track all your bills and subscriptions and see your monthly/yearly spend at a glance",
+  "author": "Baykenn",
+  "main": "dist/addon.js",
+  "sdkVersion": "3.3.0",
+  "license": "MIT",
+  "homepage": "https://github.com/Baykenn/bills-and-subscriptions",
+  "repository": "https://github.com/Baykenn/bills-and-subscriptions",
+  "keywords": ["bills", "subscriptions", "budget", "spending", "tracker"],
+  "minWealthfolioVersion": null,
+  "icon": null,
+  "enabled": true,
+  "permissions": [
+    {
+      "category": "ui",
+      "functions": [
+        { "name": "sidebar.addItem", "isDeclared": true, "isDetected": false, "detectedAt": null },
+        { "name": "router.add", "isDeclared": true, "isDetected": false, "detectedAt": null }
+      ],
+      "purpose": "Add Bills & Subscriptions to the sidebar navigation"
+    }
+  ]
+}
