@@ -1,58 +1,273 @@
-import { ScanConfig, DetectedPattern, LinkRecord, DEFAULT_SCAN_CONFIG, savePattern, saveLink, getPatterns, getLinks, removeLink } from './linker-storage';
+import { getContext } from '../context';
 
-export interface Transaction {
-  id: string; date: string; amount: number; description: string; vendor: string; accountId: string; type: 'debit' | 'credit';
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+export interface DetectedPattern {
+  id: string;
+  name: string;
+  amount: number;
+  currency: string;
+  activityType: string;
+  dates: string[];
+  frequency: 'weekly' | 'monthly' | 'quarterly' | 'yearly';
+  confidence: number;
+  lastSeen: string;
+  nextExpected: string;
+  isIncome: boolean;
 }
 
-export interface Suggestion {
-  patternId: string; vendor: string; amount: number; frequency: 'daily' | 'weekly' | 'biweekly' | 'monthly' | 'quarterly' | 'yearly'; confidence: number; lastSeen: string; isDismissed: boolean;
+export interface TransactionMatch {
+  activityId: string;
+  accountId: string;
+  accountName: string;
+  activityDate: string;
+  amount: number;
+  currency: string;
+  comment: string;
+  activityType: string;
+  confidence: number;
 }
 
-export function detectRecurringPatterns(transactions: Transaction[], config: ScanConfig = DEFAULT_SCAN_CONFIG): DetectedPattern[] {
-  const groups = new Map<string, Transaction[]>();
-  for (const tx of transactions) {
-    const r = Math.round(tx.amount * 100) / 100;
-    const key = `${tx.vendor.toLowerCase()}::${r}`;
-    const e = groups.get(key) || []; e.push(tx); groups.set(key, e);
+export interface ScanConfig {
+  enabled: boolean;
+  accountIds: string[];
+  monthsBack: number;
+  minOccurrences: number;
+  amountTolerance: number;
+}
+
+export const DEFAULT_SCAN_CONFIG: ScanConfig = {
+  enabled: true,
+  accountIds: [],
+  monthsBack: 6,
+  minOccurrences: 3,
+  amountTolerance: 0.05,
+};
+
+// ─── Detection ───────────────────────────────────────────────────────────────
+
+export async function detectPatterns(config: ScanConfig): Promise<DetectedPattern[]> {
+  if (!config.enabled || config.accountIds.length === 0) return [];
+
+  const ctx = getContext();
+  const txs: Array<{date: string; amount: number; currency: string; comment: string; activityType: string}> = [];
+  for (const accountId of config.accountIds) {
+    const activities = await ctx.api.activities.getAll(accountId);
+    for (const a of activities) {
+      const d = a.date;
+      const now = new Date();
+      const start = new Date();
+      start.setMonth(start.getMonth() - config.monthsBack);
+      start.setDate(1);
+      start.setHours(0, 0, 0, 0);
+      now.setHours(0, 0, 0, 0);
+      if (d < start || d > now) continue;
+      txs.push({
+        date: d.toISOString().slice(0, 10),
+        amount: Number(a.amount),
+        currency: a.currency,
+        comment: a.comment || '',
+        activityType: a.activityType,
+      });
+    }
   }
+
   const patterns: DetectedPattern[] = [];
-  const now = new Date();
-  const keys = Array.from(groups.keys());
-  for (const key of keys) {
-    const txs = groups.get(key);
-    if (!txs || txs.length < config.minOccurrences) continue;
-    const sorted = txs.slice().sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-    const ws = new Date(now); ws.setMonth(ws.getMonth() - config.timeWindowMonths);
-    const inW = sorted.filter(t => new Date(t.date) >= ws);
-    if (inW.length < config.minOccurrences) continue;
-    const ivls: number[] = [];
-    for (let i = 1; i < sorted.length; i++) { const d1 = new Date(sorted[i].date).getTime(); const d0 = new Date(sorted[i-1].date).getTime(); ivls.push((d1 - d0) / 86400000); }
-    const avgI = ivls.length ? ivls.reduce((a, b) => a + b, 0) / ivls.length : 30;
-    const freq = intervalToFreq(avgI);
-    const amounts = sorted.map(t => t.amount);
-    const avgA = amounts.reduce((a, b) => a + b, 0) / amounts.length;
-    const [v] = key.split('::');
-    const p: DetectedPattern = { id: genId('p'), vendor: v, amount: Math.round(avgA * 100) / 100, frequency: freq, confidence: 0, occurrences: inW.length, lastSeen: sorted[sorted.length - 1].date, accounts: [], dismissed: false };
-    savePattern(p); patterns.push(p);
+  const groups = groupByComment(txs);
+  for (const key of groups.keys()) {
+    const txns = groups.get(key);
+    if (!txns || txns.length < config.minOccurrences) continue;
+    const clusters = clusterAmounts(txns, config.amountTolerance);
+    for (let ci = 0; ci < clusters.length; ci++) {
+      const cluster = clusters[ci];
+      if (cluster.length < config.minOccurrences) continue;
+      const sorted = cluster.sort((a, b) => a.date < b.date ? -1 : 1);
+      const dates = sorted.map(tx => tx.date);
+      const intervals = calcIntervals(dates);
+      const frequency = detectFrequency(intervals);
+      const confidence = scoreConfidence(cluster.length, intervals, frequency);
+      if (frequency && confidence >= 0.4) {
+        const lastDate = dates[dates.length - 1];
+        patterns.push({
+          id: sorted[0].date + ':' + sorted[0].amount + ':' + sorted[0].currency,
+          name: sorted[0].comment,
+          amount: sorted[0].amount,
+          currency: sorted[0].currency,
+          activityType: sorted[0].activityType,
+          dates,
+          frequency,
+          confidence,
+          lastSeen: lastDate,
+          nextExpected: predictNext(lastDate, frequency),
+          isIncome: sorted[0].activityType === 'DEPOSIT',
+        });
+      }
+    }
   }
-  return patterns;
+
+  return patterns.sort((a, b) => b.confidence - a.confidence);
 }
 
-export function linkTransactionToPattern(tx: Transaction, p: DetectedPattern): LinkRecord {
-  const l: LinkRecord = { id: genId('l'), patternId: p.id, transactionId: tx.id, linkedAt: new Date().toISOString().split('T')[0] };
-  saveLink(l); return l;
+// ─── Matching ─────────────────────────────────────────────────────────────────
+
+export async function findMatches(
+  target: { name: string; amount: number; currency: string; date?: string; startDate?: string },
+  accountIds: string[]
+): Promise<TransactionMatch[]> {
+  if (!accountIds.length) return [];
+
+  const ctx = getContext();
+  const EXPENSE_TYPES = new Set(['WITHDRAWAL', 'FEE']);
+  const matches: TransactionMatch[] = [];
+  for (const accountId of accountIds) {
+    const activities = await ctx.api.activities.getAll(accountId);
+    for (const a of activities) {
+      if (!EXPENSE_TYPES.has(a.activityType)) continue;
+      const pctDiff = Math.abs(Number(a.amount) - target.amount) / Math.max(target.amount, 0.01);
+      if (pctDiff > 0.2) continue;
+      const nameScore = commentSimilarity(target.name, a.comment || '');
+      if (nameScore < 0.1) continue;
+
+      matches.push({
+        activityId: a.id,
+        accountId: a.accountId,
+        accountName: a.accountName,
+        activityDate: a.date.toISOString().slice(0, 10),
+        amount: Number(a.amount),
+        currency: a.currency,
+        comment: a.comment || '',
+        activityType: a.activityType,
+        confidence: nameScore,
+      });
+    }
+  }
+  return matches.sort((a, b) => b.confidence - a.confidence);
 }
 
-export function getSuggestions(patterns?: DetectedPattern[]): Suggestion[] {
-  const list: DetectedPattern[] = patterns || getPatterns();
-  return list.map(p => ({ patternId: p.id, vendor: p.vendor, amount: p.amount, frequency: p.frequency, confidence: Math.round(p.confidence * 100), lastSeen: p.lastSeen, isDismissed: p.dismissed }));
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function normalizeComment(comment: string): string {
+  return comment.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
 }
 
-export function unlinkTransaction(id: string): boolean { return removeLink(id); }
-export function getAllLinks(): LinkRecord[] { return getLinks(); }
-
-function intervalToFreq(d: number): 'daily' | 'weekly' | 'biweekly' | 'monthly' | 'quarterly' | 'yearly' {
-  if (d <= 2) return 'daily'; if (d <= 8) return 'weekly'; if (d <= 16) return 'biweekly'; if (d <= 35) return 'monthly'; if (d <= 100) return 'quarterly'; return 'yearly';
+function groupByComment(
+  txns: Array<{date: string; amount: number; currency: string; comment: string; activityType: string}>
+): Map<string, Array<{date: string; amount: number; currency: string; comment: string; activityType: string}>> {
+  const groups: Map<string, Array<{date: string; amount: number; currency: string; comment: string; activityType: string}>> = new Map();
+  for (let i = 0; i < txns.length; i++) {
+    const tx = txns[i];
+    const key = normalizeComment(tx.comment);
+    const existing = groups.get(key);
+    if (existing) existing.push(tx);
+    else groups.set(key, [tx]);
+  }
+  return groups;
 }
 
-function genId(p: string): string { return `${p}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`; }
+function clusterAmounts(
+  txns: Array<{date: string; amount: number; currency: string; comment: string; activityType: string}>,
+  tolerance: number
+): Array<Array<{date: string; amount: number; currency: string; comment: string; activityType: string}>> {
+  const sorted = [...txns].sort((a, b) => a.amount - b.amount);
+  const clusters: Array<Array<{date: string; amount: number; currency: string; comment: string; activityType: string}>> = [];
+  let current: Array<{date: string; amount: number; currency: string; comment: string; activityType: string}> = [];
+  let sum = 0;
+  let count = 0;
+  for (let i = 0; i < sorted.length; i++) {
+    const tx = sorted[i];
+    const avg = count > 0 ? sum / count : 0;
+    if (count === 0 || Math.abs(tx.amount - avg) / Math.max(avg, 0.01) <= tolerance) {
+      current.push(tx);
+      sum += tx.amount;
+      count++;
+    } else {
+      if (current.length > 0) clusters.push(current);
+      current = [tx];
+      sum = tx.amount;
+      count = 1;
+    }
+  }
+  if (current.length > 0) clusters.push(current);
+  return clusters;
+}
+
+function calcIntervals(dates: string[]): number[] {
+  const sorted = [...dates].sort();
+  const intervals: number[] = [];
+  for (let i = 1; i < sorted.length; i++) {
+    const d1 = new Date(sorted[i]);
+    const d0 = new Date(sorted[i - 1]);
+    const diff = (d1.getTime() - d0.getTime()) / (1000 * 60 * 60 * 24);
+    if (diff > 0) intervals.push(diff);
+  }
+  return intervals;
+}
+
+function detectFrequency(intervals: number[]): 'weekly' | 'monthly' | 'quarterly' | 'yearly' | null {
+  if (intervals.length < 2) return null;
+  const avg = intervals.reduce((a, b) => a + b) / intervals.length;
+  const variance = intervals.reduce((s, i) => s + Math.pow(i - avg, 2), 0) / intervals.length;
+  const cv = Math.sqrt(variance) / Math.max(avg, 1);
+  if (cv > 0.4) return null;
+  if (avg < 21) return 'weekly';
+  if (avg < 45) return 'monthly';
+  if (avg < 150) return 'quarterly';
+  return 'yearly';
+}
+
+function scoreConfidence(count: number, intervals: number[], frequency: string): number {
+  if (intervals.length < 2 || !frequency) return 0.4;
+  const avg = intervals.reduce((a, b) => a + b) / intervals.length;
+  const variance = intervals.reduce((s, i) => s + Math.pow(i - avg, 2), 0) / intervals.length;
+  const cv = Math.sqrt(variance) / Math.max(avg, 1);
+  let score = 0.4;
+  if (count >= 6) score += 0.15;
+  else if (count >= 3) score += 0.1;
+  if (cv < 0.1) score += 0.2;
+  else if (cv < 0.25) score += 0.1;
+  return Math.min(score, 0.95);
+}
+
+function predictNext(lastDate: string, frequency: 'weekly' | 'monthly' | 'quarterly' | 'yearly'): string {
+  const d = new Date(lastDate);
+  switch (frequency) {
+    case 'weekly': d.setDate(d.getDate() + 7); break;
+    case 'monthly': d.setMonth(d.getMonth() + 1); break;
+    case 'quarterly': d.setMonth(d.getMonth() + 3); break;
+    case 'yearly': d.setFullYear(d.getFullYear() + 1); break;
+  }
+  return d.toISOString().slice(0, 10);
+}
+
+function commentSimilarity(a: string, b: string): number {
+  const na = normalizeComment(a);
+  const nb = normalizeComment(b);
+  if (!na || !nb) return 0;
+  if (na === nb) return 1.0;
+  if (na.includes(nb) || nb.includes(na)) return 0.7;
+  const longer = na.length > nb.length ? na : nb;
+  const shorter = na.length > nb.length ? nb : na;
+  const dist = levenshtein(longer, shorter);
+  return 1 - dist / longer.length;
+}
+
+function levenshtein(a: string, b: string): number {
+  if (a.length === 0) return b.length;
+  if (b.length === 0) return a.length;
+  const m = a.length;
+  const n = b.length;
+  const dp: number[][] = [];
+  for (let i = 0; i <= m; i++) {
+    dp[i] = [];
+    for (let j = 0; j <= n; j++) dp[i][j] = 0;
+  }
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+    }
+  }
+  return dp[m][n];
+}

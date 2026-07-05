@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState, useCallback } from "react";
-import { CreditCard, BarChart2, Receipt, Settings, X, RefreshCw } from "lucide-react";
+import { CreditCard, BarChart2, Receipt, Settings, X, RefreshCw, Search, Link2 } from "lucide-react";
 import { getContext } from "../context";
 import { getSettings, saveSettings, getSyncLogCount, type AddonSettings } from "../lib/storage";
 import { syncAll, type SyncResult } from "../lib/sync";
@@ -14,9 +14,11 @@ interface Tab {
 }
 
 const ALL_TABS: Tab[] = [
-  { label: "Summary",       path: "/addons/bills-and-subscriptions/summary", icon: <BarChart2  className="h-3.5 w-3.5" /> },
-  { label: "Subscriptions", path: "/addons/bills-and-subscriptions",         icon: <CreditCard className="h-3.5 w-3.5" /> },
-  { label: "Bills",         path: "/addons/bills-and-subscriptions/bills",   icon: <Receipt    className="h-3.5 w-3.5" />, settingKey: "billsEnabled" },
+  { label: "Summary",       path: "/addons/bills-and-subscriptions/summary",      icon: <BarChart2  className="h-3.5 w-3.5" /> },
+  { label: "Subscriptions", path: "/addons/bills-and-subscriptions",              icon: <CreditCard className="h-3.5 w-3.5" /> },
+  { label: "Bills",         path: "/addons/bills-and-subscriptions/bills",        icon: <Receipt    className="h-3.5 w-3.5" />, settingKey: "billsEnabled" },
+  { label: "Suggestions",   path: "/addons/bills-and-subscriptions/suggestions",  icon: <Search     className="h-3.5 w-3.5" /> },
+  { label: "Links",         path: "/addons/bills-and-subscriptions/links",        icon: <Link2      className="h-3.5 w-3.5" /> },
 ];
 
 interface PageLayoutProps {
