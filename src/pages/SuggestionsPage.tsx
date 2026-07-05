@@ -3,7 +3,7 @@ import { Search, Link2, ChevronDown, ChevronUp, Loader2, Unlink, AlertCircle } f
 import { PageLayout } from '../components/PageLayout';
 import { getSubscriptions, formatCurrency, type Subscription } from '../lib/storage';
 import { findMatches, type TransactionMatch } from '../lib/linker';
-import { saveLink, removeLink, getLinksForSubscription, confidenceColor, type LinkedTransaction } from '../lib/linker-storage';
+import { saveLink, removeLink, getLinksForEntity, confidenceColor, type LinkedTransaction } from '../lib/linker-storage';
 import { getContext } from '../context';
 
 interface MatchState {
@@ -150,7 +150,7 @@ export function SuggestionsPage() {
     // Init linkSets from localStorage
     const initial: Record<string, Set<string>> = {};
     for (const sub of subs) {
-      const links = getLinksForSubscription(sub.id);
+      const links = getLinksForEntity(sub.id);
       initial[sub.id] = new Set(links.map(l => l.activityId));
     }
     setLinkSets(initial);
@@ -194,7 +194,8 @@ export function SuggestionsPage() {
       });
     } else {
       const link: LinkedTransaction = {
-        subscriptionId: subId,
+        entityId: subId,
+        entityType: 'subscription',
         activityId: match.activityId,
         activityDate: match.activityDate,
         amount: match.amount,

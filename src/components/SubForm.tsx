@@ -18,6 +18,7 @@ export interface SubFormState {
   website: string;
   notes: string;
   active: boolean;
+  accountId: string;
 }
 
 export function blankSubForm(currency: Currency = "USD"): SubFormState {
@@ -31,18 +32,20 @@ export function blankSubForm(currency: Currency = "USD"): SubFormState {
     website: "",
     notes: "",
     active: true,
+    accountId: "",
   };
 }
 
 interface SubFormProps {
   initial: SubFormState;
   editingId: string | null;
+  accounts: { id: string; name: string }[];
   onSave: (form: SubFormState) => void;
   onDelete: (id: string) => void;
   onClose: () => void;
 }
 
-export function SubForm({ initial, editingId, onSave, onDelete, onClose }: SubFormProps) {
+export function SubForm({ initial, editingId, accounts, onSave, onDelete, onClose }: SubFormProps) {
   const [form, setForm] = useState<SubFormState>(initial);
 
   const set = (field: keyof SubFormState, value: unknown) =>
@@ -172,6 +175,21 @@ export function SubForm({ initial, editingId, onSave, onDelete, onClose }: SubFo
             onChange={(e) => set("notes", e.target.value)}
             className="bg-background border border-border rounded-xl px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
           />
+        </div>
+
+        {/* Account */}
+        <div className="flex flex-col gap-1.5">
+          <label className="text-xs text-muted-foreground">
+            Account <span className="text-muted-foreground/50">(optional — narrows transaction search)</span>
+          </label>
+          <select
+            value={form.accountId}
+            onChange={(e) => set("accountId", e.target.value)}
+            className="bg-background border border-border rounded-xl px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+          >
+            <option value="">— any account —</option>
+            {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+          </select>
         </div>
 
         {/* Actions */}

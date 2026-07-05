@@ -37,6 +37,7 @@ export interface Subscription {
   startDate?: string;  // ISO date string
   notes?: string;
   active: boolean;
+  accountId?: string;
 }
 
 export const CYCLE_LABELS: Record<BillingCycle, string> = {
@@ -99,6 +100,7 @@ export interface Bill {
   paid: boolean;
   recurring: boolean;
   billingCycle?: BillingCycle; // only meaningful when recurring === true
+  accountId?: string;
 }
 
 const BILLS_KEY = "ss:bills";

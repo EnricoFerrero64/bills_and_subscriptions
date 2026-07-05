@@ -4,6 +4,7 @@ import { Plus, Pencil, CreditCard, ChevronDown } from "lucide-react";
 import { PageLayout } from "../components/PageLayout";
 import { LogoAvatar } from "../components/LogoAvatar";
 import { SubForm, blankSubForm, type SubFormState } from "../components/SubForm";
+import { getContext } from "../context";
 import {
   type Subscription,
   CYCLE_LABELS,
@@ -27,12 +28,19 @@ export function SubscriptionsPage() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [formInitial, setFormInitial] = useState<FormState>(() => ({ ...blankSubForm(baseCurrency), currency: baseCurrency }));
   const [listOpen, setListOpen] = useState(true);
+  const [accounts, setAccounts] = useState<{ id: string; name: string }[]>([]);
 
   const refresh = useCallback(() => {
     setSubscriptions(getSubscriptions());
   }, []);
 
   useEffect(() => { refresh(); }, [refresh]);
+
+  useEffect(() => {
+    getContext().api.accounts.getAll()
+      .then(all => setAccounts(all.filter((a: { isActive: boolean }) => a.isActive).map((a: { id: string; name: string }) => ({ id: a.id, name: a.name }))))
+      .catch(() => {});
+  }, []);
 
   const openAdd = () => {
     setEditingId(null);
@@ -52,6 +60,7 @@ export function SubscriptionsPage() {
       website: sub.website ?? "",
       notes: sub.notes ?? "",
       active: sub.active,
+      accountId: sub.accountId ?? "",
     });
     setShowForm(true);
   };
@@ -68,6 +77,7 @@ export function SubscriptionsPage() {
       website: form.website.trim() || undefined,
       notes: form.notes.trim() || undefined,
       active: form.active,
+      accountId: form.accountId || undefined,
     };
     saveSubscription(sub);
     refresh();
@@ -84,6 +94,9 @@ export function SubscriptionsPage() {
     saveSubscription({ ...sub, active: !sub.active });
     refresh();
   };
+
+  const accountMap: Record<string, string> = {};
+  for (const a of accounts) accountMap[a.id] = a.name;
 
   const activeSubs = subscriptions.filter((s) => s.active);
   const currencyTotals = activeSubs.reduce<Record<string, { monthly: number; yearly: number }>>((acc, s) => {
@@ -216,7 +229,7 @@ export function SubscriptionsPage() {
                 >
                   <LogoAvatar name={sub.name} website={sub.website} colors={CATEGORY_COLORS[sub.category]} />
 
-                  {/* Name + badge */}
+                  {/* Name + badges */}
                   <div className="flex items-center gap-2 flex-1 min-w-0">
                     <span className="text-sm font-medium text-foreground truncate">{sub.name}</span>
                     <span
@@ -225,6 +238,11 @@ export function SubscriptionsPage() {
                     >
                       {sub.category}
                     </span>
+                    {sub.accountId && accountMap[sub.accountId] && (
+                      <span className="text-xs px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground shrink-0">
+                        {accountMap[sub.accountId]}
+                      </span>
+                    )}
                   </div>
 
                   {/* Amount */}
@@ -276,6 +294,7 @@ export function SubscriptionsPage() {
         <SubForm
           initial={formInitial}
           editingId={editingId}
+          accounts={accounts}
           onSave={handleSave}
           onDelete={handleDelete}
           onClose={() => setShowForm(false)}

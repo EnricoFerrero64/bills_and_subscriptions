@@ -1,8 +1,9 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useBaseCurrency } from "../lib/useBaseCurrency";
-import { Plus, Pencil, Trash2, Zap, ChevronDown, RefreshCw } from "lucide-react";
+import { Plus, Pencil, Trash2, Zap, ChevronDown, RefreshCw, Link2, Loader2, Search, X } from "lucide-react";
 import { PageLayout } from "../components/PageLayout";
 import { LogoAvatar } from "../components/LogoAvatar";
+import { TransactionPickerModal } from "../components/TransactionPickerModal";
 import {
   type Bill,
   type BillCategory,
@@ -18,6 +19,9 @@ import {
   formatCurrency,
   advanceDateByCycle,
 } from "../lib/storage";
+import { findMatches, type TransactionMatch } from "../lib/linker";
+import { saveLink, isLinked } from "../lib/linker-storage";
+import { getContext } from "../context";
 
 const CURRENT_PATH = "/addons/bills-and-subscriptions/bills";
 
@@ -40,6 +44,7 @@ const BLANK_FORM = {
   paid: false,
   recurring: false,
   billingCycle: "monthly" as BillingCycle,
+  accountId: "",
 };
 
 type FormState = typeof BLANK_FORM;
@@ -47,12 +52,13 @@ type FormState = typeof BLANK_FORM;
 interface BillFormProps {
   initial: FormState;
   editingId: string | null;
+  accounts: { id: string; name: string }[];
   onSave: (form: FormState) => void;
   onDelete: (id: string) => void;
   onClose: () => void;
 }
 
-function BillForm({ initial, editingId, onSave, onDelete, onClose }: BillFormProps) {
+function BillForm({ initial, editingId, accounts, onSave, onDelete, onClose }: BillFormProps) {
   const [form, setForm] = useState<FormState>(initial);
   const set = (field: keyof FormState, value: unknown) =>
     setForm((prev) => ({ ...prev, [field]: value }));
@@ -198,6 +204,21 @@ function BillForm({ initial, editingId, onSave, onDelete, onClose }: BillFormPro
           </button>
         </div>
 
+        {/* Account */}
+        <div className="flex flex-col gap-1.5">
+          <label className="text-xs text-muted-foreground">
+            Account <span className="text-muted-foreground/50">(optional — narrows transaction search)</span>
+          </label>
+          <select
+            value={form.accountId}
+            onChange={(e) => set("accountId", e.target.value)}
+            className="bg-background border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+          >
+            <option value="">— any account —</option>
+            {accounts.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
+          </select>
+        </div>
+
         {/* Notes */}
         <div className="flex flex-col gap-1.5">
           <label className="text-xs text-muted-foreground">Notes <span className="text-muted-foreground/50">(optional)</span></label>
@@ -253,8 +274,55 @@ export function BillsPage() {
   const [formInitial, setFormInitial] = useState<FormState>(() => ({ ...BLANK_FORM, currency: baseCurrency }));
   const [collapsedMonths, setCollapsedMonths] = useState<Set<string>>(new Set());
 
+  // Accounts
+  const [accounts, setAccounts] = useState<{ id: string; name: string; isActive: boolean }[]>([]);
+  const [accountIds, setAccountIds] = useState<string[]>([]);
+
+  // Inline payment matching
+  const [suggestions, setSuggestions] = useState<Record<string, TransactionMatch | null>>({});
+  const [scanStatus, setScanStatus] = useState<Record<string, 'scanning' | 'done'>>({});
+  const [dismissed, setDismissed] = useState<Set<string>>(new Set());
+  const [pickerBill, setPickerBill] = useState<Bill | null>(null);
+  const scannedRef = useRef<Set<string>>(new Set());
+
   const refresh = useCallback(() => setBills(getBills()), []);
   useEffect(() => { refresh(); }, [refresh]);
+
+  // Fetch active accounts once on mount
+  useEffect(() => {
+    getContext().api.accounts.getAll()
+      .then((all: { id: string; name: string; isActive: boolean }[]) => {
+        const active = all.filter(a => a.isActive);
+        setAccounts(active);
+        setAccountIds(active.map(a => a.id));
+      })
+      .catch(() => {});
+  }, []);
+
+  // Auto-scan unpaid bills when accounts are ready
+  useEffect(() => {
+    if (accountIds.length === 0 || bills.length === 0) return;
+    const unpaid = bills.filter(b => !b.paid);
+    for (const bill of unpaid) {
+      if (scannedRef.current.has(bill.id)) continue;
+      scannedRef.current.add(bill.id);
+      const accts = bill.accountId ? [bill.accountId] : accountIds;
+      setScanStatus(prev => ({ ...prev, [bill.id]: 'scanning' }));
+      findMatches({ name: bill.name, amount: bill.amount, currency: bill.currency }, accts)
+        .then(matches => {
+          const top = matches[0] && matches[0].confidence >= 0.25 ? matches[0] : null;
+          setSuggestions(prev => ({ ...prev, [bill.id]: top }));
+          setScanStatus(prev => ({ ...prev, [bill.id]: 'done' }));
+        })
+        .catch(() => {
+          setScanStatus(prev => ({ ...prev, [bill.id]: 'done' }));
+        });
+    }
+  }, [bills, accountIds]);
+
+  const accountMap: Record<string, string> = {};
+  for (const a of accounts) accountMap[a.id] = a.name;
+  const activeAccounts = accounts.map(a => ({ id: a.id, name: a.name }));
 
   const openAdd = () => {
     setEditingId(null);
@@ -275,6 +343,7 @@ export function BillsPage() {
       paid: bill.paid,
       recurring: bill.recurring,
       billingCycle: bill.billingCycle ?? "monthly",
+      accountId: bill.accountId ?? "",
     });
     setShowForm(true);
   };
@@ -292,6 +361,7 @@ export function BillsPage() {
       paid: form.paid,
       recurring: form.recurring,
       billingCycle: form.recurring ? form.billingCycle : undefined,
+      accountId: form.accountId || undefined,
     });
     refresh();
     setShowForm(false);
@@ -307,10 +377,8 @@ export function BillsPage() {
     const markingPaid = !bill.paid;
     saveBill({ ...bill, paid: markingPaid });
 
-    // If recurring and just marked as paid, auto-create the next occurrence
     if (markingPaid && bill.recurring && bill.billingCycle) {
       const nextDate = advanceDateByCycle(bill.date, bill.billingCycle);
-      // Guard: skip if an unpaid occurrence with the same name already exists on that date
       const alreadyExists = getBills().some(
         (b) => b.name === bill.name && b.date === nextDate && !b.paid,
       );
@@ -327,11 +395,27 @@ export function BillsPage() {
           paid: false,
           recurring: true,
           billingCycle: bill.billingCycle,
+          accountId: bill.accountId,
         });
       }
     }
 
     refresh();
+  };
+
+  const confirmPayment = (bill: Bill, match: TransactionMatch) => {
+    saveLink({
+      entityId: bill.id,
+      entityType: 'bill',
+      activityId: match.activityId,
+      activityDate: match.activityDate,
+      amount: match.amount,
+      currency: match.currency,
+      description: match.comment,
+      accountName: match.accountName,
+      linkedAt: new Date().toISOString(),
+    });
+    togglePaid(bill);
   };
 
   const toggleMonth = (month: string) => {
@@ -342,10 +426,8 @@ export function BillsPage() {
     });
   };
 
-  // Sort newest first
+  // Sort newest first, group by month
   const sorted = [...bills].sort((a, b) => b.date.localeCompare(a.date));
-
-  // Group by month
   const grouped = sorted.reduce<{ month: string; items: Bill[] }[]>((acc, bill) => {
     const month = monthLabel(bill.date);
     const group = acc.find((g) => g.month === month);
@@ -358,8 +440,6 @@ export function BillsPage() {
   const currentMonth = monthLabel(today());
   const currentMonthBills = grouped.find((g) => g.month === currentMonth)?.items ?? [];
   const unpaidCount = currentMonthBills.filter((b) => !b.paid).length;
-
-  // Group current-month totals by currency so mixed-currency bills are shown correctly
   const currentByCurrency = currentMonthBills.reduce<Record<string, number>>((acc, b) => {
     acc[b.currency] = (acc[b.currency] ?? 0) + b.amount;
     return acc;
@@ -466,60 +546,124 @@ export function BillsPage() {
                   <div className="flex flex-col gap-1.5">
                     {items.map((bill) => {
                       const colors = BILL_CATEGORY_COLORS[bill.category];
+                      const suggestion = suggestions[bill.id];
+                      const scanSt = scanStatus[bill.id];
+                      const bannerShown = !bill.paid
+                        && suggestion != null
+                        && !dismissed.has(bill.id)
+                        && !isLinked(bill.id, suggestion.activityId);
+                      const showSpinner = !bill.paid && scanSt === 'scanning';
+                      const showSearchBtn = !bill.paid && !showSpinner && !bannerShown;
+
                       return (
                         <div
                           key={bill.id}
-                          className={`bg-card border border-border rounded-xl px-3 py-2.5 flex items-center gap-3 transition-opacity ${bill.paid ? "opacity-50" : ""}`}
+                          className={`bg-card border border-border rounded-xl overflow-hidden transition-opacity ${bill.paid ? "opacity-50" : ""}`}
                         >
-                          {/* Logo / category avatar */}
-                          <LogoAvatar name={bill.name} website={bill.website} colors={colors} />
+                          {/* Main row */}
+                          <div className="px-3 py-2.5 flex items-center gap-3">
+                            {/* Logo / category avatar */}
+                            <LogoAvatar name={bill.name} website={bill.website} colors={colors} />
 
-                          {/* Name + badges + date */}
-                          <div className="flex flex-col gap-0.5 flex-1 min-w-0">
-                            <div className="flex items-center gap-1.5 flex-wrap">
-                              <span className="text-sm font-medium text-foreground truncate">{bill.name}</span>
-                              <span
-                                className="text-xs px-2 py-0.5 rounded-full font-medium shrink-0"
-                                style={{ backgroundColor: colors.bg, color: colors.color }}
-                              >
-                                {bill.category}
-                              </span>
-                              {bill.recurring && (
-                                <span className="flex items-center gap-0.5 text-xs px-1.5 py-0.5 rounded-full font-medium shrink-0 bg-muted text-muted-foreground">
-                                  <RefreshCw className="h-2.5 w-2.5" />
-                                  {bill.billingCycle}
+                            {/* Name + badges + date */}
+                            <div className="flex flex-col gap-0.5 flex-1 min-w-0">
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <span className="text-sm font-medium text-foreground truncate">{bill.name}</span>
+                                <span
+                                  className="text-xs px-2 py-0.5 rounded-full font-medium shrink-0"
+                                  style={{ backgroundColor: colors.bg, color: colors.color }}
+                                >
+                                  {bill.category}
                                 </span>
-                              )}
+                                {bill.recurring && (
+                                  <span className="flex items-center gap-0.5 text-xs px-1.5 py-0.5 rounded-full font-medium shrink-0 bg-muted text-muted-foreground">
+                                    <RefreshCw className="h-2.5 w-2.5" />
+                                    {bill.billingCycle}
+                                  </span>
+                                )}
+                                {bill.accountId && accountMap[bill.accountId] && (
+                                  <span className="text-xs px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground shrink-0">
+                                    {accountMap[bill.accountId]}
+                                  </span>
+                                )}
+                              </div>
+                              <span className="text-xs text-muted-foreground">
+                                {new Date(bill.date).toLocaleDateString(undefined, { day: "numeric", month: "short" })}
+                              </span>
                             </div>
-                            <span className="text-xs text-muted-foreground">
-                              {new Date(bill.date).toLocaleDateString(undefined, { day: "numeric", month: "short" })}
+
+                            {/* Amount */}
+                            <span className="text-sm font-semibold text-foreground tabular-nums shrink-0">
+                              {formatCurrency(bill.amount, bill.currency)}
                             </span>
+
+                            {/* Paid toggle */}
+                            <button
+                              onClick={() => togglePaid(bill)}
+                              title={bill.paid ? "Mark unpaid" : "Mark paid"}
+                              className={`w-7 h-3.5 rounded-full transition-colors shrink-0 relative ${bill.paid ? "bg-primary" : "bg-muted"}`}
+                            >
+                              <span
+                                className="absolute top-0.5 w-2.5 h-2.5 bg-white rounded-full shadow transition-all"
+                                style={{ left: bill.paid ? "calc(100% - 12px)" : "2px" }}
+                              />
+                            </button>
+
+                            {/* Scan spinner / 🔍 search button */}
+                            {showSpinner && (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground shrink-0" />
+                            )}
+                            {showSearchBtn && (
+                              <button
+                                onClick={() => setPickerBill(bill)}
+                                title="Find matching transaction"
+                                className="text-muted-foreground hover:text-foreground transition-colors shrink-0 p-1 rounded-lg hover:bg-muted"
+                              >
+                                <Search className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+
+                            {/* Edit */}
+                            <button
+                              onClick={() => openEdit(bill)}
+                              className="text-muted-foreground hover:text-foreground transition-colors shrink-0 p-1 rounded-lg hover:bg-muted"
+                            >
+                              <Pencil className="h-3.5 w-3.5" />
+                            </button>
                           </div>
 
-                          {/* Amount */}
-                          <span className="text-sm font-semibold text-foreground tabular-nums shrink-0">
-                            {formatCurrency(bill.amount, bill.currency)}
-                          </span>
-
-                          {/* Paid toggle */}
-                          <button
-                            onClick={() => togglePaid(bill)}
-                            title={bill.paid ? "Mark unpaid" : "Mark paid"}
-                            className={`w-7 h-3.5 rounded-full transition-colors shrink-0 relative ${bill.paid ? "bg-primary" : "bg-muted"}`}
-                          >
-                            <span
-                              className="absolute top-0.5 w-2.5 h-2.5 bg-white rounded-full shadow transition-all"
-                              style={{ left: bill.paid ? "calc(100% - 12px)" : "2px" }}
-                            />
-                          </button>
-
-                          {/* Edit */}
-                          <button
-                            onClick={() => openEdit(bill)}
-                            className="text-muted-foreground hover:text-foreground transition-colors shrink-0 p-1 rounded-lg hover:bg-muted"
-                          >
-                            <Pencil className="h-3.5 w-3.5" />
-                          </button>
+                          {/* Suggestion banner */}
+                          {bannerShown && suggestion && (
+                            <div className="flex items-center gap-2 px-3 py-2 bg-primary/5 border-t border-primary/20 text-xs">
+                              <Link2 className="h-3 w-3 text-primary shrink-0" />
+                              <span className="flex-1 truncate text-foreground">
+                                <span className="font-medium">{suggestion.comment || '—'}</span>
+                                <span className="text-muted-foreground">
+                                  {" · "}{suggestion.activityDate}{" · "}{formatCurrency(suggestion.amount, suggestion.currency)}
+                                </span>
+                              </span>
+                              <button
+                                onClick={() => confirmPayment(bill, suggestion)}
+                                className="shrink-0 flex items-center gap-1 px-2 py-0.5 rounded-md font-medium bg-primary text-primary-foreground hover:opacity-90 transition-opacity"
+                              >
+                                ✓ Confirm
+                              </button>
+                              <button
+                                onClick={() => setPickerBill(bill)}
+                                title="Show all matches"
+                                className="shrink-0 text-muted-foreground hover:text-foreground transition-colors px-1"
+                              >
+                                ▾
+                              </button>
+                              <button
+                                onClick={() => setDismissed(prev => new Set([...prev, bill.id]))}
+                                title="Dismiss"
+                                className="shrink-0 text-muted-foreground hover:text-foreground transition-colors p-0.5 rounded"
+                              >
+                                <X className="h-3 w-3" />
+                              </button>
+                            </div>
+                          )}
                         </div>
                       );
                     })}
@@ -535,9 +679,24 @@ export function BillsPage() {
         <BillForm
           initial={formInitial}
           editingId={editingId}
+          accounts={activeAccounts}
           onSave={handleSave}
           onDelete={handleDelete}
           onClose={() => setShowForm(false)}
+        />
+      )}
+
+      {pickerBill && (
+        <TransactionPickerModal
+          entityName={pickerBill.name}
+          entityAmount={pickerBill.amount}
+          entityCurrency={pickerBill.currency}
+          accountIds={pickerBill.accountId ? [pickerBill.accountId] : accountIds}
+          onSelect={(match) => {
+            confirmPayment(pickerBill, match);
+            setPickerBill(null);
+          }}
+          onClose={() => setPickerBill(null)}
         />
       )}
     </PageLayout>

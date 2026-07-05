@@ -110,7 +110,8 @@ export function confidenceColor(confidence: number): string {
 // ─── Linked transactions ──────────────────────────────────────────────────────
 
 export interface LinkedTransaction {
-  subscriptionId: string;
+  entityId: string;
+  entityType: 'subscription' | 'bill';
   activityId: string;
   activityDate: string;
   amount: number;
@@ -133,25 +134,25 @@ export function getLinks(): LinkedTransaction[] {
   }
 }
 
-export function getLinksForSubscription(subscriptionId: string): LinkedTransaction[] {
-  return getLinks().filter(l => l.subscriptionId === subscriptionId);
+export function getLinksForEntity(entityId: string): LinkedTransaction[] {
+  return getLinks().filter(l => l.entityId === entityId);
 }
 
 export function saveLink(link: LinkedTransaction): void {
   const all = getLinks().filter(
-    l => !(l.subscriptionId === link.subscriptionId && l.activityId === link.activityId)
+    l => !(l.entityId === link.entityId && l.activityId === link.activityId)
   );
   all.push(link);
   localStorage.setItem(LINKS_KEY, JSON.stringify(all));
 }
 
-export function removeLink(subscriptionId: string, activityId: string): void {
+export function removeLink(entityId: string, activityId: string): void {
   const all = getLinks().filter(
-    l => !(l.subscriptionId === subscriptionId && l.activityId === activityId)
+    l => !(l.entityId === entityId && l.activityId === activityId)
   );
   localStorage.setItem(LINKS_KEY, JSON.stringify(all));
 }
 
-export function isLinked(subscriptionId: string, activityId: string): boolean {
-  return getLinks().some(l => l.subscriptionId === subscriptionId && l.activityId === activityId);
+export function isLinked(entityId: string, activityId: string): boolean {
+  return getLinks().some(l => l.entityId === entityId && l.activityId === activityId);
 }

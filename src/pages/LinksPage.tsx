@@ -17,7 +17,7 @@ export function LinksPage() {
     const allLinks = getLinks();
     const result: GroupedLinks[] = [];
     for (const sub of subs) {
-      const links = allLinks.filter(l => l.subscriptionId === sub.id);
+      const links = allLinks.filter(l => l.entityId === sub.id && l.entityType === 'subscription');
       if (links.length > 0) {
         result.push({ sub, links: links.sort((a, b) => b.activityDate.localeCompare(a.activityDate)) });
       }
