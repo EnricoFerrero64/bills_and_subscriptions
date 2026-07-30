@@ -1,7 +1,8 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { Plus } from "lucide-react";
 import { PageLayout } from "../components/PageLayout";
 import { LogoAvatar } from "../components/LogoAvatar";
+import { getContext } from "../context";
 import {
   type Subscription,
   type SubscriptionCategory,
@@ -18,6 +19,9 @@ import {
   toYearly,
   formatCurrency,
   extractDomain,
+  monthKey,
+  formatMonthLabel,
+  todayISO,
 } from "../lib/storage";
 import { useBaseCurrency } from "../lib/useBaseCurrency";
 import { SubForm, blankSubForm, type SubFormState } from "../components/SubForm";
@@ -39,12 +43,52 @@ interface BillCategoryTotal {
   count: number;
 }
 
-function currentMonthLabel(): string {
-  return new Date().toLocaleDateString(undefined, { month: "long", year: "numeric" });
+const MONTH_KEY_RE = /^(\d{4})-(\d{2})$/;
+
+/** Numeric parts of a "YYYY-MM" key, or null if malformed. */
+function parseMonthKeyParts(key: string): { y: number; m: number } | null {
+  const match = MONTH_KEY_RE.exec(key);
+  return match ? { y: Number(match[1]), m: Number(match[2]) } : null;
 }
 
-function billMonthLabel(dateStr: string): string {
-  return new Date(dateStr).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+/** Whole months from `fromKey` to `toKey`, counting both ends. 0 if malformed. */
+function monthSpanInclusive(fromKey: string, toKey: string): number {
+  const from = parseMonthKeyParts(fromKey);
+  const to = parseMonthKeyParts(toKey);
+  if (!from || !to) return 0;
+  return to.y * 12 + to.m - (from.y * 12 + from.m) + 1;
+}
+
+/**
+ * "2026-02" -> "Feb 26", built from numeric parts and rendered in UTC — the same
+ * discipline as storage.formatMonthLabel, so no timezone can shift the month.
+ * The chart's x-axis deliberately does NOT use formatMonthLabel: its full
+ * "February 2026" is far too wide for six ticks in a 480px viewBox. The full
+ * label is exposed to assistive tech via aria-label instead.
+ */
+function shortMonthLabel(key: string): string {
+  const p = parseMonthKeyParts(key);
+  if (!p) return key;
+  return new Date(Date.UTC(p.y, p.m - 1, 1)).toLocaleDateString(undefined, {
+    month: "short",
+    year: "2-digit",
+    timeZone: "UTC",
+  });
+}
+
+function fmtTick(v: number): string {
+  if (v >= 10000) return `${(v / 1000).toFixed(0)}k`;
+  if (v >= 1000) return `${(v / 1000).toFixed(1)}k`;
+  return String(Math.round(v));
+}
+
+function describeError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  try {
+    return String(err);
+  } catch {
+    return "unknown error";
+  }
 }
 
 export function SummaryPage() {
@@ -53,6 +97,7 @@ export function SummaryPage() {
   const billsEnabled = settings.billsEnabled;
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
   const [bills, setBills] = useState<Bill[]>([]);
+  const [accounts, setAccounts] = useState<{ id: string; name: string }[]>([]);
   const [showAddForm, setShowAddForm] = useState(false);
 
   useEffect(() => {
@@ -71,7 +116,34 @@ export function SummaryPage() {
     if (billsEnabled) setBills(getBills());
   }, [billsEnabled]);
 
+  // The add form needs the real account list, otherwise its account dropdown is
+  // silently empty and every subscription added here is unassigned.
+  useEffect(() => {
+    let mounted = true;
+    const ctx = getContext();
+    ctx.api.accounts
+      .getAll()
+      .then((all) => {
+        // Navigating away mid-fetch must not write into an unmounted component.
+        if (!mounted) return;
+        setAccounts(all.filter((a) => a.isActive).map((a) => ({ id: a.id, name: a.name })));
+      })
+      .catch((err: unknown) => {
+        if (!mounted) return;
+        // The user needs to know the picker will be empty; the cause belongs in the log.
+        ctx.api.toast.error("Couldn't load accounts. The account picker will be empty.");
+        ctx.api.logger.error(
+          `[bills-and-subscriptions] SummaryPage accounts.getAll failed: ${describeError(err)}`,
+        );
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
   const handleAddSub = (form: SubFormState) => {
+    // Persist every field the form collects — startDate in particular, because
+    // Wealthfolio Sync skips subscriptions that have none.
     saveSubscription({
       id: generateId(),
       name: form.name.trim(),
@@ -79,108 +151,210 @@ export function SummaryPage() {
       currency: form.currency,
       billingCycle: form.billingCycle,
       category: form.category,
-      website: form.website || undefined,
-      notes: form.notes || undefined,
-      active: true,
+      startDate: form.startDate || undefined,
+      website: form.website.trim() || undefined,
+      notes: form.notes.trim() || undefined,
+      active: form.active,
+      accountId: form.accountId || undefined,
     });
     setSubscriptions(getSubscriptions());
     setShowAddForm(false);
   };
 
   // ── Subscriptions ─────────────────────────────────────────────────────────
-  const active = subscriptions.filter((s) => s.active);
+  const active = useMemo(() => subscriptions.filter((s) => s.active), [subscriptions]);
 
-  const byCurrency = active.reduce<Record<string, Subscription[]>>((acc, s) => {
-    if (!acc[s.currency]) acc[s.currency] = [];
-    acc[s.currency].push(s);
-    return acc;
-  }, {});
+  const byCurrency = useMemo(
+    () =>
+      active.reduce<Record<string, Subscription[]>>((acc, s) => {
+        if (!acc[s.currency]) acc[s.currency] = [];
+        acc[s.currency].push(s);
+        return acc;
+      }, {}),
+    [active],
+  );
 
-  const currencies = Object.keys(byCurrency);
+  const currencies = useMemo(() => Object.keys(byCurrency), [byCurrency]);
   const primaryCurrency = currencies[0] ?? "USD";
   const primarySubs = byCurrency[primaryCurrency] ?? [];
 
-  const grandMonthly = primarySubs.reduce((sum, s) => sum + toMonthly(s.amount, s.billingCycle), 0);
-  const grandYearly  = primarySubs.reduce((sum, s) => sum + toYearly(s.amount, s.billingCycle), 0);
+  const grandMonthly = useMemo(
+    () => primarySubs.reduce((sum, s) => sum + toMonthly(s.amount, s.billingCycle), 0),
+    [primarySubs],
+  );
+  const grandYearly = useMemo(
+    () => primarySubs.reduce((sum, s) => sum + toYearly(s.amount, s.billingCycle), 0),
+    [primarySubs],
+  );
 
-  const subCategoryMap = primarySubs.reduce<Record<string, SubCategoryTotal>>((acc, s) => {
-    const cat = s.category;
-    if (!acc[cat]) acc[cat] = { category: cat, monthly: 0, yearly: 0, currency: s.currency, count: 0 };
-    acc[cat].monthly += toMonthly(s.amount, s.billingCycle);
-    acc[cat].yearly  += toYearly(s.amount, s.billingCycle);
-    acc[cat].count   += 1;
-    return acc;
-  }, {});
+  const subCategoryTotals = useMemo(() => {
+    const map = primarySubs.reduce<Record<string, SubCategoryTotal>>((acc, s) => {
+      const cat = s.category;
+      if (!acc[cat]) acc[cat] = { category: cat, monthly: 0, yearly: 0, currency: s.currency, count: 0 };
+      acc[cat].monthly += toMonthly(s.amount, s.billingCycle);
+      acc[cat].yearly  += toYearly(s.amount, s.billingCycle);
+      acc[cat].count   += 1;
+      return acc;
+    }, {});
+    return Object.values(map).sort((a, b) => b.monthly - a.monthly);
+  }, [primarySubs]);
 
-  const subCategoryTotals = Object.values(subCategoryMap).sort((a, b) => b.monthly - a.monthly);
   const maxSubMonthly = subCategoryTotals[0]?.monthly ?? 1;
 
-  const sortedSubs = [...primarySubs]
-    .sort((a, b) => toMonthly(b.amount, b.billingCycle) - toMonthly(a.amount, a.billingCycle));
+  const sortedSubs = useMemo(
+    () =>
+      [...primarySubs].sort(
+        (a, b) => toMonthly(b.amount, b.billingCycle) - toMonthly(a.amount, a.billingCycle),
+      ),
+    [primarySubs],
+  );
 
   // ── Bills ─────────────────────────────────────────────────────────────────
-  const thisMonth      = currentMonthLabel();
-  const thisMonthBills = bills.filter((b) => billMonthLabel(b.date) === thisMonth);
-  const billPrimaryCur = thisMonthBills[0]?.currency ?? primaryCurrency;
+  // Everything below groups on the stable "YYYY-MM" key. Localised month labels
+  // are produced only at render time: parsing "2026-02-01" with new Date() reads
+  // as UTC midnight but renders in local time, so west of Greenwich every bill
+  // dated the 1st fell into the previous month.
+  const currentMonthKey = monthKey(todayISO());
+
+  const thisMonthBills = useMemo(
+    () => bills.filter((b) => monthKey(b.date) === currentMonthKey),
+    [bills, currentMonthKey],
+  );
+  const billPrimaryCur = thisMonthBills[0]?.currency ?? bills[0]?.currency ?? primaryCurrency;
 
   // This-month totals
-  const billMonthTotal  = thisMonthBills.reduce((sum, b) => sum + b.amount, 0);
-  const billUnpaidTotal = thisMonthBills.filter((b) => !b.paid).reduce((sum, b) => sum + b.amount, 0);
-  const billUnpaidCount = thisMonthBills.filter((b) => !b.paid).length;
+  const billMonthTotal = useMemo(
+    () => thisMonthBills.reduce((sum, b) => sum + b.amount, 0),
+    [thisMonthBills],
+  );
+  const unpaidThisMonth = useMemo(() => thisMonthBills.filter((b) => !b.paid), [thisMonthBills]);
+  const billUnpaidTotal = useMemo(
+    () => unpaidThisMonth.reduce((sum, b) => sum + b.amount, 0),
+    [unpaidThisMonth],
+  );
+  const billUnpaidCount = unpaidThisMonth.length;
 
   // Category breakdown across all bills (not just this month)
-  const billCategoryMap = bills.reduce<Record<string, BillCategoryTotal & { bills: Bill[] }>>((acc, b) => {
-    const cat = b.category;
-    if (!acc[cat]) acc[cat] = { category: cat, total: 0, currency: b.currency, count: 0, bills: [] };
-    acc[cat].total += b.amount;
-    acc[cat].count += 1;
-    // Keep unique bills by name for logo display
-    const isDuplicate = acc[cat].bills.some((existing) => {
-      if (b.website && existing.website)
-        return extractDomain(b.website) === extractDomain(existing.website);
-      return existing.name.trim().toLowerCase() === b.name.trim().toLowerCase();
-    });
-    if (!isDuplicate) acc[cat].bills.push(b);
-    return acc;
-  }, {});
+  const billCategoryTotals = useMemo(() => {
+    const map = bills.reduce<Record<string, BillCategoryTotal & { bills: Bill[] }>>((acc, b) => {
+      const cat = b.category;
+      if (!acc[cat]) acc[cat] = { category: cat, total: 0, currency: b.currency, count: 0, bills: [] };
+      acc[cat].total += b.amount;
+      acc[cat].count += 1;
+      // Keep unique bills by name for logo display
+      const isDuplicate = acc[cat].bills.some((existing) => {
+        if (b.website && existing.website)
+          return extractDomain(b.website) === extractDomain(existing.website);
+        return existing.name.trim().toLowerCase() === b.name.trim().toLowerCase();
+      });
+      if (!isDuplicate) acc[cat].bills.push(b);
+      return acc;
+    }, {});
+    return Object.values(map).sort((a, b) => b.total - a.total);
+  }, [bills]);
 
-  const billCategoryTotals = Object.values(billCategoryMap).sort((a, b) => b.total - a.total);
   const maxBillTotal = billCategoryTotals[0]?.total ?? 1;
 
-  // Last 6 months bill history
-  const billsByMonth = bills.reduce<Record<string, { total: number; currency: string }>>((acc, b) => {
-    const m = billMonthLabel(b.date);
-    if (!acc[m]) acc[m] = { total: 0, currency: b.currency };
-    acc[m].total += b.amount;
-    return acc;
-  }, {});
+  // Bills keyed by month. Bills with an unparseable date have no month to belong
+  // to, so they are left out of the history rather than bucketed under "".
+  const billsByMonth = useMemo(
+    () =>
+      bills.reduce<Record<string, { total: number; currency: string }>>((acc, b) => {
+        const key = monthKey(b.date);
+        if (!key) return acc;
+        if (!acc[key]) acc[key] = { total: 0, currency: b.currency };
+        acc[key].total += b.amount;
+        return acc;
+      }, {}),
+    [bills],
+  );
 
-  const billMonthHistory = Object.entries(billsByMonth)
-    .sort(([a], [b]) => {
-      const toSort = (label: string) => {
-        const d = new Date(label);
-        return isNaN(d.getTime()) ? label : d.toISOString();
-      };
-      return toSort(b).localeCompare(toSort(a));
-    })
-    .slice(0, 6)
-    .reverse();
+  // Last 6 months bill history. Month keys sort chronologically as plain strings
+  // ("2026-02" < "2026-10"), with no locale or Date parsing in the comparison.
+  const billMonthHistory = useMemo(
+    () =>
+      Object.entries(billsByMonth)
+        .sort(([a], [b]) => (a < b ? 1 : a > b ? -1 : 0))
+        .slice(0, 6)
+        .reverse(),
+    [billsByMonth],
+  );
 
-  const maxMonthHistory = Math.max(...billMonthHistory.map(([, v]) => v.total), 1);
+  const maxMonthHistory = useMemo(
+    () => Math.max(...billMonthHistory.map(([, v]) => v.total), 1),
+    [billMonthHistory],
+  );
 
   const hasSubscriptions = active.length > 0;
   const hasBills = billsEnabled && bills.length > 0;
 
-  // Bills monthly average across all recorded months
-  const billMonthCount   = Object.keys(billsByMonth).length;
-  const billTotalAllTime = bills.reduce((sum, b) => sum + b.amount, 0);
-  const billMonthlyAvg   = billMonthCount > 0 ? billTotalAllTime / billMonthCount : 0;
+  const billTotalAllTime = useMemo(() => bills.reduce((sum, b) => sum + b.amount, 0), [bills]);
 
-  // Combined totals (same currency assumed — note shown if they differ)
-  const combinedCurrency   = primaryCurrency;
-  const combinedMonthly    = grandMonthly + billMonthlyAvg;
-  const combinedYearly     = grandYearly + billMonthlyAvg * 12;
-  const currenciesMismatch = hasBills && billPrimaryCur !== primaryCurrency;
+  // Monthly average over the full calendar range the bills actually cover:
+  // first recorded month → current month (or the last recorded month, if bills are
+  // dated ahead), inclusive. Dividing by "months that have a bill" reported two
+  // bills eight months apart as a 2-month average, roughly quadrupling the figure.
+  const billMonthlyAvg = useMemo(() => {
+    const keys = Object.keys(billsByMonth);
+    if (keys.length === 0) return 0;
+    let first = keys[0];
+    let last = keys[0];
+    for (const k of keys) {
+      if (k < first) first = k;
+      if (k > last) last = k;
+    }
+    const end = last > currentMonthKey ? last : currentMonthKey;
+    const months = monthSpanInclusive(first, end);
+    return months > 0 ? billTotalAllTime / months : 0;
+  }, [billsByMonth, billTotalAllTime, currentMonthKey]);
+
+  // Combined totals. There are no FX rates available here, so a single total is
+  // only ever shown when subscriptions and bills are in the same currency.
+  const currenciesMismatch = hasSubscriptions && hasBills && billPrimaryCur !== primaryCurrency;
+  const combinedCurrency = hasSubscriptions ? primaryCurrency : billPrimaryCur;
+  const combinedMonthly = grandMonthly + billMonthlyAvg;
+  const combinedYearly = grandYearly + billMonthlyAvg * 12;
+
+  // Chart geometry — memoised alongside the data it draws. null when there is
+  // not enough history to plot (the JSX below renders nothing in that case).
+  const chart = useMemo(() => {
+    const n = billMonthHistory.length;
+    if (n < 2) return null;
+
+    const VIEW_W = 480;
+    const VIEW_H = 180;
+    const PAD_L = 44;
+    const PAD_R = 44;
+    const PAD_T = 12;
+    const PAD_B = 22;
+    const plotW = VIEW_W - PAD_L - PAD_R;
+    const plotH = VIEW_H - PAD_T - PAD_B;
+    const slotW = plotW / n;
+    const barW = Math.max(slotW * 0.24, 3);
+
+    const cumulativeTotals: number[] = [];
+    let running = 0;
+    for (const [, { total }] of billMonthHistory) {
+      running += total;
+      cumulativeTotals.push(running);
+    }
+    const maxCumulative = running || 1;
+    const barYMax = maxMonthHistory || 1;
+
+    const toX = (i: number) => PAD_L + slotW * i + slotW / 2;
+    const toBarY = (v: number) => PAD_T + plotH - (v / barYMax) * plotH;
+    const toLineY = (v: number) => PAD_T + plotH - (v / maxCumulative) * plotH;
+
+    const TICK_COUNT = 4;
+    const barTicks = Array.from({ length: TICK_COUNT + 1 }, (_, i) => Math.round((i / TICK_COUNT) * barYMax));
+    const lineTicks = Array.from({ length: TICK_COUNT + 1 }, (_, i) => Math.round((i / TICK_COUNT) * maxCumulative));
+    const linePoints = cumulativeTotals.map((v, i) => `${toX(i)},${toLineY(v)}`).join(' ');
+
+    return {
+      VIEW_W, VIEW_H, PAD_L, PAD_R, PAD_T, PAD_B, plotH, barW,
+      cumulativeTotals, barYMax, toX, toBarY, toLineY, barTicks, lineTicks, linePoints,
+    };
+  }, [billMonthHistory, maxMonthHistory]);
 
   if (!hasSubscriptions && !hasBills) {
     return (
@@ -205,25 +379,64 @@ export function SummaryPage() {
               {/* 1/3: Monthly total */}
               <div className="flex flex-col justify-center gap-1 pr-5">
                 <span className="text-xs text-muted-foreground uppercase tracking-wide font-semibold">Total spend</span>
-                <span className="text-3xl font-bold text-foreground tabular-nums leading-none">
-                  {formatCurrency(combinedMonthly, combinedCurrency)}
-                </span>
+                {currenciesMismatch ? (
+                  /* Summing across currencies without exchange rates would invent a
+                     number, so the two components are shown instead of a total. */
+                  <div className="flex flex-col gap-1.5">
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="text-xs text-muted-foreground">Subscriptions</span>
+                      <span className="text-xl font-bold text-foreground tabular-nums leading-none">
+                        {formatCurrency(grandMonthly, primaryCurrency)}
+                      </span>
+                    </div>
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="text-xs text-muted-foreground">Bills</span>
+                      <span className="text-xl font-bold text-foreground tabular-nums leading-none">
+                        {formatCurrency(billMonthlyAvg, billPrimaryCur)}
+                      </span>
+                    </div>
+                  </div>
+                ) : (
+                  <span className="text-3xl font-bold text-foreground tabular-nums leading-none">
+                    {formatCurrency(combinedMonthly, combinedCurrency)}
+                  </span>
+                )}
                 <span className="text-xs text-muted-foreground">per month</span>
               </div>
 
               {/* 2/3: Yearly projection */}
               <div className="flex flex-col justify-center gap-1 px-5">
                 <span className="text-xs text-muted-foreground uppercase tracking-wide font-semibold">Yearly projection</span>
-                <span className="text-3xl font-bold text-foreground tabular-nums leading-none">
-                  {formatCurrency(combinedYearly, combinedCurrency)}
-                </span>
+                {currenciesMismatch ? (
+                  <div className="flex flex-col gap-1.5">
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="text-xs text-muted-foreground">Subscriptions</span>
+                      <span className="text-xl font-bold text-foreground tabular-nums leading-none">
+                        {formatCurrency(grandYearly, primaryCurrency)}
+                      </span>
+                    </div>
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="text-xs text-muted-foreground">Bills</span>
+                      <span className="text-xl font-bold text-foreground tabular-nums leading-none">
+                        {formatCurrency(billMonthlyAvg * 12, billPrimaryCur)}
+                      </span>
+                    </div>
+                  </div>
+                ) : (
+                  <span className="text-3xl font-bold text-foreground tabular-nums leading-none">
+                    {formatCurrency(combinedYearly, combinedCurrency)}
+                  </span>
+                )}
                 <span className="text-xs text-muted-foreground">
-                  {formatCurrency(combinedYearly / 52, combinedCurrency)} / week
+                  {currenciesMismatch
+                    ? "per year"
+                    : `${formatCurrency(combinedYearly / 52, combinedCurrency)} / week`}
                 </span>
               </div>
 
-              {/* 3/3: Spend sources */}
-              {hasSubscriptions && hasBills && combinedMonthly > 0 && (
+              {/* 3/3: Spend sources — a percentage split of a cross-currency sum
+                     would be as meaningless as the sum itself, so it is hidden then. */}
+              {hasSubscriptions && hasBills && !currenciesMismatch && combinedMonthly > 0 && (
                 <div className="flex flex-col justify-center gap-3 pl-5">
                   {(() => {
                     const pct = Math.round((grandMonthly / combinedMonthly) * 100);
@@ -263,7 +476,7 @@ export function SummaryPage() {
             </div>
             {currenciesMismatch && (
               <p className="text-xs text-muted-foreground/60 mt-3">
-                Bills are in {billPrimaryCur}; combined total uses {combinedCurrency} figures as-is.
+                Subscriptions are in {primaryCurrency} and bills in {billPrimaryCur}; shown separately, not converted.
               </p>
             )}
           </div>
@@ -386,41 +599,11 @@ export function SummaryPage() {
               )}
 
               {billMonthHistory.length > 1 && (() => {
-                const VIEW_W = 480;
-                const VIEW_H = 180;
-                const PAD_L = 44;
-                const PAD_R = 44;
-                const PAD_T = 12;
-                const PAD_B = 22;
-                const plotW = VIEW_W - PAD_L - PAD_R;
-                const plotH = VIEW_H - PAD_T - PAD_B;
-                const n = billMonthHistory.length;
-                const slotW = plotW / n;
-                const barW = Math.max(slotW * 0.24, 3);
-
-                const cumulativeTotals: number[] = [];
-                let running = 0;
-                for (const [, { total }] of billMonthHistory) {
-                  running += total;
-                  cumulativeTotals.push(running);
-                }
-                const maxCumulative = running || 1;
-                const barYMax = maxMonthHistory || 1;
-
-                const toX = (i: number) => PAD_L + slotW * i + slotW / 2;
-                const toBarY = (v: number) => PAD_T + plotH - (v / barYMax) * plotH;
-                const toLineY = (v: number) => PAD_T + plotH - (v / maxCumulative) * plotH;
-
-                const TICK_COUNT = 4;
-                const barTicks = Array.from({ length: TICK_COUNT + 1 }, (_, i) => Math.round((i / TICK_COUNT) * barYMax));
-                const lineTicks = Array.from({ length: TICK_COUNT + 1 }, (_, i) => Math.round((i / TICK_COUNT) * maxCumulative));
-                const linePoints = cumulativeTotals.map((v, i) => `${toX(i)},${toLineY(v)}`).join(' ');
-
-                const fmtTick = (v: number) => {
-                  if (v >= 10000) return `${(v / 1000).toFixed(0)}k`;
-                  if (v >= 1000) return `${(v / 1000).toFixed(1)}k`;
-                  return String(Math.round(v));
-                };
+                if (!chart) return null;
+                const {
+                  VIEW_W, VIEW_H, PAD_L, PAD_R, PAD_T, plotH, barW,
+                  cumulativeTotals, barYMax, toX, toBarY, toLineY, barTicks, lineTicks, linePoints,
+                } = chart;
 
                 return (
                   <div className="bg-card border border-border rounded-xl p-4 flex flex-col gap-2">
@@ -450,7 +633,7 @@ export function SummaryPage() {
                       ))}
                       {/* Bars */}
                       {billMonthHistory.map(([month, { total }], i) => {
-                        const isCurrentMonth = month === thisMonth;
+                        const isCurrentMonth = month === currentMonthKey;
                         const bH = Math.max((total / barYMax) * plotH, 1);
                         const x = toX(i) - barW / 2;
                         const y = PAD_T + plotH - bH;
@@ -477,14 +660,14 @@ export function SummaryPage() {
                       ))}
                       {/* X-axis labels */}
                       {billMonthHistory.map(([month], i) => {
-                        const isCurrentMonth = month === thisMonth;
-                        const label = new Date(month).toLocaleDateString(undefined, { month: "short", year: "2-digit" });
+                        const isCurrentMonth = month === currentMonthKey;
                         return (
                           <text key={month} x={toX(i)} y={VIEW_H - 4}
                             textAnchor="middle" fontSize="9"
                             fill="currentColor" fillOpacity={isCurrentMonth ? 0.8 : 0.4}
-                            fontWeight={isCurrentMonth ? "600" : "400"}>
-                            {label}
+                            fontWeight={isCurrentMonth ? "600" : "400"}
+                            aria-label={formatMonthLabel(month)}>
+                            {shortMonthLabel(month)}
                           </text>
                         );
                       })}
@@ -551,6 +734,7 @@ export function SummaryPage() {
         <SubForm
           initial={blankSubForm(baseCurrency)}
           editingId={null}
+          accounts={accounts}
           onSave={handleAddSub}
           onDelete={() => {}}
           onClose={() => setShowAddForm(false)}
