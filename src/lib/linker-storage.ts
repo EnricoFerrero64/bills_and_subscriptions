@@ -1,117 +1,20 @@
-import type { DetectedPattern, ScanConfig } from './linker';
-import { DEFAULT_SCAN_CONFIG } from './linker';
+// Persistence for links between a bill/subscription and a real account activity.
+//
+// The links array lives under storage.ts's canonical LINKS_KEY — this module
+// must never define its own key, because the v1 -> v2 migration in storage.ts
+// moves the data there and deletes the legacy pre-v2 key.
 
-const SCAN_CONFIG_KEY = 'ss:scan-config';
-const DETECTED_PATTERNS_KEY = 'ss:detected-patterns';
-const IGNORED_PATTERN_KEYS_KEY = 'ss:ignored-pattern-keys';
+import { LINKS_KEY, persist } from "./storage";
 
-export function getScanConfig(): ScanConfig {
-  try {
-    const raw = localStorage.getItem(SCAN_CONFIG_KEY);
-    if (!raw) return { ...DEFAULT_SCAN_CONFIG };
-    return { ...DEFAULT_SCAN_CONFIG, ...JSON.parse(raw) };
-  } catch {
-    return { ...DEFAULT_SCAN_CONFIG };
-  }
-}
+// Re-exported so existing importers of this module keep working. New code
+// should import these from "./storage" directly.
+export { generateId, formatCurrency } from "./storage";
 
-export function saveScanConfig(config: ScanConfig): void {
-  localStorage.setItem(SCAN_CONFIG_KEY, JSON.stringify(config));
-  window.dispatchEvent(new CustomEvent('ss:scan-config-changed'));
-}
-
-export function getDetectedPatterns(): DetectedPattern[] {
-  try {
-    const raw = localStorage.getItem(DETECTED_PATTERNS_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-export function saveDetectedPatterns(patterns: DetectedPattern[]): void {
-  localStorage.setItem(DETECTED_PATTERNS_KEY, JSON.stringify(patterns));
-}
-
-export function getIgnoredPatternKeys(): string[] {
-  try {
-    const raw = localStorage.getItem(IGNORED_PATTERN_KEYS_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-export function addIgnoredPatternKey(key: string): void {
-  const keys = getIgnoredPatternKeys();
-  if (!keys.includes(key)) {
-    keys.push(key);
-    localStorage.setItem(IGNORED_PATTERN_KEYS_KEY, JSON.stringify(keys));
-  }
-}
-
-export function removeIgnoredPatternKey(key: string): void {
-  const keys = getIgnoredPatternKeys();
-  localStorage.setItem(IGNORED_PATTERN_KEYS_KEY, JSON.stringify(keys.filter(k => k !== key)));
-}
-
-export function isPatternIgnored(key: string): boolean {
-  return getIgnoredPatternKeys().includes(key);
-}
-
-// Generate a unique key for a pattern (used for ignoring)
-export function patternKey(name: string, amount: number, currency: string): string {
-  return `${name}||${amount}||${currency}`;
-}
-
-// Generate a unique ID
-export function generateId(): string {
-  return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-}
-
-// Format currency
-export function formatCurrency(amount: number, currency: string): string {
-  return new Intl.NumberFormat(undefined, {
-    style: 'currency',
-    currency,
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(amount);
-}
-
-// Frequency label
-export function frequencyLabel(freq: 'weekly' | 'monthly' | 'quarterly' | 'yearly'): string {
-  switch (freq) {
-    case 'weekly': return '/ week';
-    case 'monthly': return '/ month';
-    case 'quarterly': return '/ quarter';
-    case 'yearly': return '/ year';
-  }
-}
-
-// Confidence label
-export function confidenceLabel(confidence: number): string {
-  if (confidence >= 0.8) return 'High';
-  if (confidence >= 0.6) return 'Medium';
-  return 'Good';
-}
-
-// Confidence color
-export function confidenceColor(confidence: number): string {
-  if (confidence >= 0.8) return '#36a15d'; // green
-  if (confidence >= 0.6) return '#b58026'; // amber
-  return '#d2722d'; // orange
-}
-
-// ─── Linked transactions ──────────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface LinkedTransaction {
   entityId: string;
-  entityType: 'subscription' | 'bill';
+  entityType: "subscription" | "bill";
   activityId: string;
   activityDate: string;
   amount: number;
@@ -121,38 +24,80 @@ export interface LinkedTransaction {
   linkedAt: string;
 }
 
-const LINKS_KEY = 'blink:links';
+// ─── Read path ────────────────────────────────────────────────────────────────
 
 export function getLinks(): LinkedTransaction[] {
   try {
     const raw = localStorage.getItem(LINKS_KEY);
     if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as LinkedTransaction[]) : [];
   } catch {
     return [];
   }
 }
 
 export function getLinksForEntity(entityId: string): LinkedTransaction[] {
-  return getLinks().filter(l => l.entityId === entityId);
+  return getLinks().filter((l) => l.entityId === entityId);
 }
 
-export function saveLink(link: LinkedTransaction): void {
-  const all = getLinks().filter(
-    l => !(l.entityId === link.entityId && l.activityId === link.activityId)
-  );
-  all.push(link);
-  localStorage.setItem(LINKS_KEY, JSON.stringify(all));
+/** Every linked activityId, for excluding already-used transactions from match results. */
+export function getLinkedActivityIds(): Set<string> {
+  return new Set(getLinks().map((l) => l.activityId));
 }
 
-export function removeLink(entityId: string, activityId: string): void {
-  const all = getLinks().filter(
-    l => !(l.entityId === entityId && l.activityId === activityId)
-  );
-  localStorage.setItem(LINKS_KEY, JSON.stringify(all));
+/** The key format used by getLinkKeys, so callers don't hand-roll it. */
+export function linkKey(entityId: string, activityId: string): string {
+  return `${entityId}|${activityId}`;
+}
+
+/**
+ * "${entityId}|${activityId}" for every link. Build this once per render and
+ * test it with linkKey() — isLinked() re-reads and re-parses the whole array on
+ * every call, which is O(rows) localStorage hits inside a render loop.
+ */
+export function getLinkKeys(): Set<string> {
+  return new Set(getLinks().map((l) => linkKey(l.entityId, l.activityId)));
 }
 
 export function isLinked(entityId: string, activityId: string): boolean {
-  return getLinks().some(l => l.entityId === entityId && l.activityId === activityId);
+  return getLinks().some((l) => l.entityId === entityId && l.activityId === activityId);
+}
+
+// ─── Write path ───────────────────────────────────────────────────────────────
+
+/** Shares storage.ts's write path, so a QuotaExceededError here reaches the
+ *  same registered handler (and therefore the same host toast) as everywhere
+ *  else, instead of being swallowed into the console. */
+function persistLinks(links: LinkedTransaction[]): void {
+  persist(LINKS_KEY, links);
+}
+
+/** Upsert: replaces any existing link with the same entityId+activityId. */
+export function saveLink(link: LinkedTransaction): void {
+  const all = getLinks().filter(
+    (l) => !(l.entityId === link.entityId && l.activityId === link.activityId),
+  );
+  all.push(link);
+  persistLinks(all);
+}
+
+export function removeLink(entityId: string, activityId: string): void {
+  persistLinks(
+    getLinks().filter((l) => !(l.entityId === entityId && l.activityId === activityId)),
+  );
+}
+
+/** Remove every link belonging to one bill or subscription. */
+export function removeLinksForEntity(entityId: string): void {
+  persistLinks(getLinks().filter((l) => l.entityId !== entityId));
+}
+
+// ─── Presentation ─────────────────────────────────────────────────────────────
+
+/** Traffic-light colour for a 0..1 confidence score. */
+export function confidenceColor(confidence: number): string {
+  if (confidence >= 0.8) return "#36a15d"; // green
+  if (confidence >= 0.6) return "#b58026"; // amber
+  return "#d2722d"; // orange
 }

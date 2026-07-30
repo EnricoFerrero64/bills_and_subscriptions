@@ -137,7 +137,8 @@ export function setStorageErrorHandler(fn: StorageErrorHandler | null): void {
   storageErrorHandler = fn;
 }
 
-function reportStorageError(err: unknown, key: string): void {
+/** Exported so sibling data modules report through the same channel. */
+export function reportStorageError(err: unknown, key: string): void {
   try {
     storageErrorHandler?.(err, key);
   } catch {
@@ -145,9 +146,9 @@ function reportStorageError(err: unknown, key: string): void {
   }
 }
 
-/** The single write path. Serialises, catches quota/serialisation failures,
- *  reports them, and never throws. */
-function persist(key: string, value: unknown): void {
+/** The single write path for every module that owns an "ss:" key. Serialises,
+ *  catches quota/serialisation failures, reports them, and never throws. */
+export function persist(key: string, value: unknown): void {
   try {
     localStorage.setItem(key, JSON.stringify(value));
   } catch (err) {
