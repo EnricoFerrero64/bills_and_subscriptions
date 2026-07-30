@@ -68,12 +68,16 @@ const MAX_PAGES = 40;
 
 // ─── Activity cache ───────────────────────────────────────────────────────────
 
-interface ActivityCacheEntry {
-  key: string;
-  promise: Promise<ExpenseTx[]>;
-}
+/**
+ * Keyed by account set, because callers legitimately ask for different sets: a
+ * page loads the union of active accounts, while a bill pinned to one account
+ * asks for just that one. A single-entry cache turns that alternation into a
+ * 0% hit rate — each narrow request evicts the union snapshot and the next wide
+ * request re-downloads everything. Small bound: the sets in play are few.
+ */
+const MAX_CACHE_ENTRIES = 8;
 
-let cache: ActivityCacheEntry | null = null;
+const cache = new Map<string, Promise<ExpenseTx[]>>();
 
 function cacheKey(accountIds: string[]): string {
   return [...accountIds].sort().join("|");
@@ -81,7 +85,7 @@ function cacheKey(accountIds: string[]): string {
 
 /** Drop the cache — call after the addon writes activities (sync). */
 export function invalidateActivityCache(): void {
-  cache = null;
+  cache.clear();
 }
 
 /**
@@ -95,13 +99,20 @@ export async function loadExpenseActivities(accountIds: string[]): Promise<Expen
   if (accountIds.length === 0) return [];
 
   const key = cacheKey(accountIds);
-  if (cache && cache.key === key) return cache.promise;
+  const cached = cache.get(key);
+  if (cached) return cached;
 
   const promise = fetchExpenseActivities(accountIds);
-  cache = { key, promise };
+  // Evict the oldest first: Map preserves insertion order, so the first key is
+  // the least recently added.
+  if (cache.size >= MAX_CACHE_ENTRIES) {
+    const oldest = cache.keys().next();
+    if (!oldest.done) cache.delete(oldest.value);
+  }
+  cache.set(key, promise);
   // A failed fetch must not be cached, or the page never recovers from a blip.
   promise.catch(() => {
-    if (cache && cache.key === key) cache = null;
+    if (cache.get(key) === promise) cache.delete(key);
   });
   return promise;
 }

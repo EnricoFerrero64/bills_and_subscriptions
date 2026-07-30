@@ -1,10 +1,23 @@
 import { useRef, useEffect, useState, useCallback } from "react";
-import { CreditCard, BarChart2, Receipt, Settings, X, RefreshCw, Search, Link2 } from "lucide-react";
+import {
+  CreditCard, BarChart2, Receipt, Settings, X, RefreshCw, Search, Link2,
+  Download, Upload, AlertTriangle,
+} from "lucide-react";
 import { getContext } from "../context";
-import { getSettings, saveSettings, getSyncLogCount, type AddonSettings } from "../lib/storage";
+import {
+  exportData,
+  getSettings,
+  getSyncLogCount,
+  importData,
+  saveSettings,
+  setStorageErrorHandler,
+  todayISO,
+  type AddonSettings,
+  type ImportSummary,
+} from "../lib/storage";
 import { syncAll, type SyncResult } from "../lib/sync";
 import type { Account } from "@wealthfolio/addon-sdk";
-import type { ReactNode } from "react";
+import type { ChangeEvent, ReactNode } from "react";
 
 interface Tab {
   label: string;
@@ -21,6 +34,43 @@ const ALL_TABS: Tab[] = [
   { label: "Links",         path: "/addons/bills-and-subscriptions/links",        icon: <Link2      className="h-3.5 w-3.5" /> },
 ];
 
+const LOG_PREFIX = "[bills-and-subscriptions]";
+
+/** Turn anything throwable into one short line for a toast or a log entry. */
+function errorMessage(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  if (typeof err === "string" && err.trim()) return err.trim();
+  return "unexpected error";
+}
+
+/**
+ * One compact line describing a finished sync.
+ *
+ * "Already up to date" is reserved for a run that genuinely had nothing to do:
+ * `skipped` is always reported, because an entity is now skipped for real,
+ * fixable reasons (no start date, invalid date, no account) and reading that as
+ * "up to date" hid the problem.
+ */
+function summariseSync(result: SyncResult): string {
+  const parts: string[] = [];
+  if (result.synced > 0) parts.push(`+${result.synced} new`);
+  if (result.skipped > 0) parts.push(`${result.skipped} skipped`);
+  if (result.failed > 0) parts.push(`${result.failed} failed`);
+  if (parts.length === 0) return "Already up to date";
+  if (result.synced === 0) parts.unshift("Nothing new");
+  return parts.join(" · ");
+}
+
+interface PendingImport {
+  fileName: string;
+  json: string;
+}
+
+interface StatusMessage {
+  kind: "ok" | "error";
+  text: string;
+}
+
 interface PageLayoutProps {
   children: ReactNode;
   activePath: string;
@@ -36,23 +86,85 @@ export function PageLayout({ children, activePath }: PageLayoutProps) {
 
   // Sync state
   const [accounts, setAccounts] = useState<Account[]>([]);
+  /** Active accounts that exist but are not typed CASH — used to explain an
+   *  empty dropdown instead of leaving the user to guess. */
+  const [otherActiveCount, setOtherActiveCount] = useState(0);
+  const [accountsLoading, setAccountsLoading] = useState(false);
+  const [accountsFailed, setAccountsFailed] = useState(false);
   const [syncRunning, setSyncRunning] = useState(false);
   const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
   const [syncTotal, setSyncTotal] = useState(getSyncLogCount);
 
+  // Backup / restore state
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [pendingImport, setPendingImport] = useState<PendingImport | null>(null);
+  const [backupStatus, setBackupStatus] = useState<StatusMessage | null>(null);
+
+  /** Pending tab navigation, so an unmount inside the 200ms window cancels it. */
+  const navTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const tabs = ALL_TABS.filter(
     (t) => !t.settingKey || settings[t.settingKey]
   );
+  /** Identity of the *visible* tab set — the indicator has to be re-measured
+   *  whenever this changes, not only when activePath does. */
+  const tabKey = tabs.map((t) => t.path).join("|");
 
-  // Load cash accounts when settings opens
+  // Storage failures are otherwise completely silent: a write that hits
+  // QuotaExceededError looks saved and is gone. PageLayout wraps every page, so
+  // registering here covers the whole addon exactly once.
+  useEffect(() => {
+    setStorageErrorHandler((err, key) => {
+      ctx.api.toast.error(
+        "Couldn't save your changes — this app's local storage is full. Export a backup, then delete a few old bills or subscriptions to free up space.",
+      );
+      ctx.api.logger.error(`${LOG_PREFIX} storage write failed for "${key}": ${errorMessage(err)}`);
+    });
+    // Unregister on cleanup so a remounted layout does not stack handlers (and
+    // does not leave one bound to a stale ctx).
+    return () => setStorageErrorHandler(null);
+  }, [ctx]);
+
+  // Load cash accounts when settings opens.
   useEffect(() => {
     if (!showSettings) return;
     setSyncResult(null);
     setSyncTotal(getSyncLogCount());
+    setAccountsLoading(true);
+    setAccountsFailed(false);
+
+    // Closing the modal mid-fetch must not write to a dead component.
+    let mounted = true;
     ctx.api.accounts.getAll()
-      .then((all) => setAccounts(all.filter((a) => a.isActive && a.accountType === "CASH")))
-      .catch(() => setAccounts([]));
-  }, [showSettings]);
+      .then((all) => {
+        if (!mounted) return;
+        const active = all.filter((a) => a.isActive);
+        const cash = active.filter((a) => a.accountType === "CASH");
+        setAccounts(cash);
+        setOtherActiveCount(active.length - cash.length);
+      })
+      .catch((err: unknown) => {
+        // Was swallowed into an empty dropdown, which reads as "no accounts".
+        ctx.api.toast.error("Couldn't load your accounts. Close Settings and try again.");
+        ctx.api.logger.error(`${LOG_PREFIX} accounts.getAll failed: ${errorMessage(err)}`);
+        if (!mounted) return;
+        setAccounts([]);
+        setOtherActiveCount(0);
+        setAccountsFailed(true);
+      })
+      .finally(() => {
+        if (mounted) setAccountsLoading(false);
+      });
+
+    return () => { mounted = false; };
+  }, [showSettings, ctx]);
+
+  // Cancel a queued navigation if we unmount before it fires.
+  useEffect(() => {
+    return () => {
+      if (navTimer.current !== null) clearTimeout(navTimer.current);
+    };
+  }, []);
 
   const measureTab = useCallback((path: string) => {
     const container = navRef.current;
@@ -70,13 +182,18 @@ export function PageLayout({ children, activePath }: PageLayoutProps) {
     requestAnimationFrame(() => {
       requestAnimationFrame(() => setAnimated(true));
     });
-  }, [activePath, measureTab]);
+    // tabKey: toggling Bills adds/removes a tab, which moves every tab after it.
+  }, [activePath, tabKey, measureTab]);
 
   const handleTabClick = (tab: Tab) => {
     if (tab.path === activePath) return;
     const pos = measureTab(tab.path);
     if (pos) setIndicator(pos);
-    setTimeout(() => ctx.api.navigation.navigate(tab.path), 200);
+    if (navTimer.current !== null) clearTimeout(navTimer.current);
+    navTimer.current = setTimeout(() => {
+      navTimer.current = null;
+      ctx.api.navigation.navigate(tab.path);
+    }, 200);
   };
 
   const handleToggleSetting = (key: keyof AddonSettings) => {
@@ -104,8 +221,70 @@ export function PageLayout({ children, activePath }: PageLayoutProps) {
       const result = await syncAll(settings.syncAccountId);
       setSyncResult(result);
       setSyncTotal(getSyncLogCount());
+    } catch (err) {
+      // syncAll() is documented never to reject. Belt and braces: if that ever
+      // regresses, the user gets a toast instead of a silent unhandled rejection.
+      const message = errorMessage(err);
+      ctx.api.toast.error(`Sync failed: ${message}`);
+      ctx.api.logger.error(`${LOG_PREFIX} syncAll threw: ${message}`);
     } finally {
       setSyncRunning(false);
+    }
+  };
+
+  const handleExport = async () => {
+    setBackupStatus(null);
+    try {
+      // openSaveDialog resolves `unknown` and gives no way to tell "saved" from
+      // "cancelled", so we deliberately do not claim success afterwards.
+      await ctx.api.files.openSaveDialog(
+        exportData(),
+        `subscriptions-and-bills-${todayISO()}.json`,
+      );
+    } catch (err) {
+      const message = errorMessage(err);
+      ctx.api.toast.error(`Couldn't save the backup: ${message}`);
+      ctx.api.logger.error(`${LOG_PREFIX} export failed: ${message}`);
+    }
+  };
+
+  const handleFileChosen = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    // Reset immediately so picking the same file twice still fires onChange.
+    e.target.value = "";
+    if (!file) return;
+    setBackupStatus(null);
+    setPendingImport(null);
+    try {
+      // Read here, confirm later: if the file is unreadable the user finds out
+      // before being asked to approve a destructive replace.
+      const json = await file.text();
+      setPendingImport({ fileName: file.name, json });
+    } catch (err) {
+      const message = errorMessage(err);
+      setBackupStatus({ kind: "error", text: `Couldn't read that file: ${message}` });
+      ctx.api.logger.error(`${LOG_PREFIX} could not read import file: ${message}`);
+    }
+  };
+
+  const handleConfirmImport = () => {
+    if (!pendingImport) return;
+    try {
+      const summary: ImportSummary = importData(pendingImport.json);
+      setPendingImport(null);
+      // importData may have replaced settings too, so re-read rather than trust
+      // the copy in state (billsEnabled drives the tab set).
+      setSettings(getSettings());
+      setSyncTotal(getSyncLogCount());
+      setSyncResult(null);
+      setBackupStatus({
+        kind: "ok",
+        text: `Restored ${summary.subscriptions} subscription(s), ${summary.bills} bill(s) and ${summary.links} link(s). Switch tabs to reload them.`,
+      });
+      ctx.api.toast.success("Backup restored.");
+    } catch (err) {
+      // importData throws a short, user-facing message — show it as-is.
+      setBackupStatus({ kind: "error", text: errorMessage(err) });
     }
   };
 
@@ -180,7 +359,9 @@ export function PageLayout({ children, activePath }: PageLayoutProps) {
           style={{ backgroundColor: "rgba(0,0,0,0.55)" }}
           onClick={(e) => { if (e.target === e.currentTarget) setShowSettings(false); }}
         >
-          <div className="bg-card border border-border rounded-2xl shadow-2xl w-full max-w-sm p-5 flex flex-col gap-4 overflow-hidden">
+          {/* max-h + scroll: sync errors and the import confirmation can both
+              add rows, and the modal must not grow past the viewport. */}
+          <div className="bg-card border border-border rounded-2xl shadow-2xl w-full max-w-sm p-5 flex flex-col gap-4 max-h-[85vh] overflow-y-auto">
             <div className="flex items-center justify-between">
               <h2 className="text-sm font-semibold text-foreground">Settings</h2>
               <button
@@ -236,6 +417,20 @@ export function PageLayout({ children, activePath }: PageLayoutProps) {
                   ))}
                 </select>
 
+                {/* An empty dropdown used to look like a broken feature. */}
+                {!accountsLoading && !accountsFailed && accounts.length === 0 && (
+                  <span className="text-xs text-muted-foreground">
+                    {otherActiveCount > 0
+                      ? `No cash accounts to sync to. ${otherActiveCount} other active account(s) exist, but sync only offers accounts of type “Cash”.`
+                      : "No active cash accounts yet. Add one in Wealthfolio to enable sync."}
+                  </span>
+                )}
+                {accountsFailed && (
+                  <span className="text-xs text-muted-foreground">
+                    Couldn't load your accounts. Reopen Settings to retry.
+                  </span>
+                )}
+
                 {settings.syncAccountId && (
                   <div className="flex items-center gap-3">
                     <button
@@ -248,18 +443,102 @@ export function PageLayout({ children, activePath }: PageLayoutProps) {
                     </button>
                     {syncResult && (
                       <span className="text-xs text-muted-foreground">
-                        {syncResult.synced > 0
-                          ? `+${syncResult.synced} new`
-                          : "Already up to date"}
-                        {syncResult.failed > 0 && `, ${syncResult.failed} failed`}
+                        {summariseSync(syncResult)}
                       </span>
                     )}
                   </div>
                 )}
 
+                {/* Why charges were skipped or rejected. Capped at 10 by the lib;
+                    scrolls in place so it can never stretch the modal. */}
+                {syncResult && syncResult.errors.length > 0 && (
+                  <ul className="flex flex-col gap-1 rounded-lg border border-border bg-muted/40 px-2.5 py-2 max-h-28 overflow-y-auto">
+                    {syncResult.errors.map((message, i) => (
+                      <li key={i} className="text-xs text-muted-foreground leading-snug break-words">
+                        {message}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+
                 {settings.syncAccountId && (
                   <span className="text-xs text-muted-foreground/60">
                     Subscriptions without a start date are skipped.
+                  </span>
+                )}
+              </div>
+
+              {/* Backup — localStorage is the only copy of this data. */}
+              <div className="flex flex-col gap-2 py-2 border-t border-border">
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-sm text-foreground">Backup</span>
+                  <span className="text-xs text-muted-foreground">
+                    Save everything to a file, or restore a previous backup.
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handleExport}
+                    className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-border text-foreground hover:bg-muted transition-colors"
+                  >
+                    <Download className="h-3 w-3" />
+                    Export
+                  </button>
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg border border-border text-foreground hover:bg-muted transition-colors"
+                  >
+                    <Upload className="h-3 w-3" />
+                    Import…
+                  </button>
+                </div>
+
+                {/* The host has no file-read API (files.openCsvDialog returns a
+                    path, not contents), so the webview's own file input reads it. */}
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="application/json,.json"
+                  className="hidden"
+                  onChange={handleFileChosen}
+                />
+
+                {/* Import replaces everything, so it never happens on one click. */}
+                {pendingImport && (
+                  <div className="flex flex-col gap-2 rounded-lg border border-red-400/40 bg-red-400/10 px-2.5 py-2">
+                    <div className="flex items-start gap-1.5">
+                      <AlertTriangle className="h-3.5 w-3.5 text-red-400 shrink-0 mt-0.5" />
+                      <span className="text-xs text-foreground leading-snug break-words">
+                        Restoring <span className="font-medium">{pendingImport.fileName}</span> deletes
+                        every subscription, bill, linked transaction and sync record stored here and
+                        replaces them with the file's contents. This can't be undone.
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={handleConfirmImport}
+                        className="text-xs px-3 py-1.5 rounded-lg bg-red-400 text-background hover:opacity-90 transition-opacity"
+                      >
+                        Replace all data
+                      </button>
+                      <button
+                        onClick={() => setPendingImport(null)}
+                        className="text-xs px-3 py-1.5 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {backupStatus && (
+                  <span
+                    className={`text-xs leading-snug break-words ${
+                      backupStatus.kind === "error" ? "text-red-400" : "text-muted-foreground"
+                    }`}
+                  >
+                    {backupStatus.text}
                   </span>
                 )}
               </div>

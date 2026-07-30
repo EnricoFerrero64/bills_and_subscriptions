@@ -6,6 +6,7 @@ import {
   getBills,
   formatCurrency,
   formatDayLabel,
+  onDataChanged,
   type Bill,
   type Subscription,
 } from "../lib/storage";
@@ -154,6 +155,11 @@ export function LinksPage() {
   }, []);
 
   useEffect(() => { refresh(); }, [refresh]);
+
+  // Links are created on the Bills and Suggestions pages, and entities are
+  // deleted elsewhere too, so a mount-only read showed stale data on the way
+  // back here.
+  useEffect(() => onDataChanged(refresh), [refresh]);
 
   const handleUnlink = useCallback((entityId: string, activityId: string) => {
     removeLink(entityId, activityId);

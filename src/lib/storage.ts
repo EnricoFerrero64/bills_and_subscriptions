@@ -146,6 +146,28 @@ export function reportStorageError(err: unknown, key: string): void {
   }
 }
 
+// ─── Change notification ──────────────────────────────────────────────────────
+
+/**
+ * Pages read their slice of localStorage on mount, so a write made on one tab
+ * left every other tab stale until it happened to remount — a link created on
+ * the Bills page was missing from the Links page, and vice versa. Every write
+ * goes through persist(), so one dispatch there covers all of them.
+ */
+const DATA_CHANGED_EVENT = "ss:data-changed";
+
+/** Subscribe to writes. Returns an unsubscribe function.
+ *  `keys` optionally narrows to the storage keys the caller cares about. */
+export function onDataChanged(fn: (key: string) => void, keys?: readonly string[]): () => void {
+  const handler = (e: Event) => {
+    const key = (e as CustomEvent<{ key: string }>).detail?.key ?? "";
+    if (keys && !keys.includes(key)) return;
+    fn(key);
+  };
+  window.addEventListener(DATA_CHANGED_EVENT, handler);
+  return () => window.removeEventListener(DATA_CHANGED_EVENT, handler);
+}
+
 /** The single write path for every module that owns an "ss:" key. Serialises,
  *  catches quota/serialisation failures, reports them, and never throws. */
 export function persist(key: string, value: unknown): void {
@@ -153,6 +175,12 @@ export function persist(key: string, value: unknown): void {
     localStorage.setItem(key, JSON.stringify(value));
   } catch (err) {
     reportStorageError(err, key);
+    return; // Nothing changed, so do not tell listeners it did.
+  }
+  try {
+    window.dispatchEvent(new CustomEvent(DATA_CHANGED_EVENT, { detail: { key } }));
+  } catch {
+    // Notification is a nicety; a successful write must still count as one.
   }
 }
 
@@ -403,6 +431,24 @@ export function formatDayLabel(dateStr: string): string {
     month: "short",
     timeZone: "UTC",
   });
+}
+
+/**
+ * "2026-02-03" -> "3 Feb 2026". Same locale-aware, UTC-pinned formatting as
+ * formatDayLabel, plus the year — matched transactions are ranked by name and
+ * amount rather than recency, so the top candidate is routinely from a prior
+ * year and a bare day+month would be ambiguous exactly when it matters. The
+ * year is lifted off the ISO string, never re-parsed through a local Date.
+ */
+export function formatFullDate(dateStr: string): string {
+  const label = formatDayLabel(dateStr);
+  return label ? `${label} ${dateStr.slice(0, 4)}` : "";
+}
+
+/** Best-effort human-readable form of an unknown thrown value. */
+export function describeError(err: unknown): string {
+  if (err instanceof Error) return err.message || err.name;
+  return String(err);
 }
 
 /** "2026-02" -> "2026-02-01" (first day of that month). */
