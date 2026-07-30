@@ -17,6 +17,16 @@ A [Wealthfolio](https://wealthfolio.app) addon that tracks your recurring subscr
 - [Wealthfolio](https://wealthfolio.app) desktop app (Windows / macOS)
 - Node.js 18+ (for building from source)
 
+## Permissions
+
+Wealthfolio shows these on install. All of them are declared in `manifest.json`:
+
+- **Account Management** (`accounts`) — reads your account list so you can pick which cash account a bill is charged to, and which accounts to scan. Never creates or edits accounts.
+- **Transaction History** (`activities`) — reads transactions on the accounts you select to detect recurring charges and match bills to the real bank movement that paid them; writes withdrawal activities only when you turn on **Wealthfolio Sync**.
+- **Application Settings** (`settings`) — reads your base currency so totals match the rest of the app. Read-only.
+- **File Operations** (`files`) — opens the system save dialog when you export your bills and subscriptions, so you choose the destination.
+- **User Interface** (`ui`) — adds the sidebar entry and registers the addon's pages.
+
 ## Installation
 
 ### From source
