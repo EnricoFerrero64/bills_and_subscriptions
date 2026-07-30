@@ -36,7 +36,11 @@ Thumbs.db
 # Claude Code local settings (machine-specific hooks)
 .claude/settings.local.json
 
-# Developer-only files — kept locally, not for public repo
+# Developer-only files — kept locally, not for public repo.
+# Listing a path here does NOT untrack a file that was already committed; that
+# needs `git rm --cached -r <path>` once (the file stays on disk). docs/ was
+# committed before this rule existed, which is why it appeared in the repo
+# despite being ignored.
 CLAUDE.md
 ROADMAP.md
 docs/

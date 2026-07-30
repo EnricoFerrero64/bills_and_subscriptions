@@ -46,6 +46,18 @@ Then open Wealthfolio, go to **Settings → Addons**, and enable **Bills & Subsc
 npm run dev:deploy  # rebuilds and redeploys on every file save
 ```
 
+### Tests and type-checking
+
+```bash
+npm test            # unit suite, run once per timezone (UTC + America/New_York)
+npm run test:watch  # vitest in watch mode
+npm run type-check  # tsc --noEmit; also runs as part of build / ship / package
+```
+
+Tests live in `test/` and cover the pure logic: date arithmetic and cycle series,
+UTC-pinned formatting, migrations, backup import/export, transaction matching and
+link grouping. Components are not rendered — React comes from the host at runtime.
+
 ## Project structure
 
 ```

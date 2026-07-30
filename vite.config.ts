@@ -27,6 +27,13 @@ export default defineConfig({
       },
     },
     outDir: "dist",
+    // Deliberately unminified. Minifying saves ~33 kB (185 kB -> 152 kB), which
+    // buys nothing here: the addon is read from local disk by a desktop app, so
+    // there is no transfer cost, and gzip size is irrelevant. Against that,
+    // scripts/package-zip.mjs ships addon.js WITHOUT addon.js.map, so a minified
+    // release would turn every user-reported stack trace into unreadable
+    // one-letter frames — and host-API/quota/sync failures are exactly what
+    // users report. Readable released JS is worth 33 kB of local disk.
     minify: false,
     sourcemap: true,
   },

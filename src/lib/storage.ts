@@ -320,13 +320,27 @@ export function toYearly(amount: number, cycle: BillingCycle): number {
   }
 }
 
+/**
+ * Never throws. Intl rejects anything that is not a 3-letter ISO 4217 code with
+ * a RangeError, and the currency reaching this function is not always one: link
+ * rows carry whatever currency the host had on the activity, and a restored
+ * backup is only validated structurally. This is called from render bodies, so a
+ * throw would blank the whole page — including the buttons needed to delete the
+ * offending row — leaving the addon unusable until localStorage is cleared by
+ * hand. Falls back to "12.30 US$" rather than dying.
+ */
 export function formatCurrency(amount: number, currency: string): string {
-  return new Intl.NumberFormat(undefined, {
-    style: "currency",
-    currency,
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  }).format(amount);
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    }).format(amount);
+  } catch {
+    const shown = Number.isFinite(amount) ? amount.toFixed(2) : String(amount);
+    return currency ? `${shown} ${currency}` : shown;
+  }
 }
 
 // ─── Date helpers ─────────────────────────────────────────────────────────────
@@ -638,7 +652,13 @@ export function importData(json: string): ImportSummary {
   }
 
   // Everything below is validated — write only now.
-  const cleanLinks = dedupeLinks(Array.isArray(links) ? links : []);
+  // Links go through upgradeLink first: a backup taken before v2 carries
+  // { subscriptionId }, and the import stamps SCHEMA_VERSION at the end, so
+  // runMigrations() would never get the chance to rewrite them. Without this,
+  // restoring an old backup lands every link in the orphaned bucket with its
+  // bill/subscription association permanently lost. upgradeLink is a no-op on
+  // links that are already in the current shape.
+  const cleanLinks = dedupeLinks((Array.isArray(links) ? links : []).map(upgradeLink));
   save(SUBS_KEY, subscriptions as Subscription[]);
   save(BILLS_KEY, bills as Bill[]);
   save(LINKS_KEY, cleanLinks);
