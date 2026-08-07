@@ -7,12 +7,15 @@
   "author": "Baykenn",
   "license": "MIT",
   "scripts": {
-    "build": "vite build",
-    "ship": "vite build && node scripts/deploy.mjs",
-    "package": "node scripts/package-zip.mjs",
+    "build": "npm run type-check && vite build",
+    "ship": "npm run type-check && npm test && vite build && node scripts/deploy.mjs",
+    "package": "npm run type-check && npm test && node scripts/package-zip.mjs",
+    "dev": "vite build --watch",
     "dev:deploy": "concurrently \"npm run dev\" \"npm run watch:deploy\"",
     "watch:deploy": "node scripts/watch-deploy.mjs",
-    "type-check": "tsc --noEmit"
+    "type-check": "tsc --noEmit",
+    "test": "node scripts/test-timezones.mjs",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@wealthfolio/addon-sdk": "^3.3.0",
@@ -28,7 +31,8 @@
     "concurrently": "^9.1.2",
     "tailwindcss": "^4.1.18",
     "typescript": "^5.9.3",
-    "vite": "^7.3.1"
+    "vite": "^7.3.1",
+    "vitest": "^3.2.7"
   },
   "peerDependencies": {
     "react": "^19.2.4",

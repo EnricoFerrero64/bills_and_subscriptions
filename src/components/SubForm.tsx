@@ -39,13 +39,15 @@ export function blankSubForm(currency: Currency = "USD"): SubFormState {
 interface SubFormProps {
   initial: SubFormState;
   editingId: string | null;
-  accounts: { id: string; name: string }[];
+  /** Optional with an empty default: a caller that forgets it gets an empty
+   *  dropdown, never a TypeError from accounts.map() taking the page down. */
+  accounts?: { id: string; name: string }[];
   onSave: (form: SubFormState) => void;
   onDelete: (id: string) => void;
   onClose: () => void;
 }
 
-export function SubForm({ initial, editingId, accounts, onSave, onDelete, onClose }: SubFormProps) {
+export function SubForm({ initial, editingId, accounts = [], onSave, onDelete, onClose }: SubFormProps) {
   const [form, setForm] = useState<SubFormState>(initial);
 
   const set = (field: keyof SubFormState, value: unknown) =>

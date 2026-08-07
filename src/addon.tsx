@@ -3,6 +3,7 @@ import React from "react";
 import { Layers } from "lucide-react";
 import type { AddonContext } from "@wealthfolio/addon-sdk";
 import { setContext } from "./context";
+import { runMigrations } from "./lib/storage";
 import { SubscriptionsPage } from "./pages/SubscriptionsPage";
 import { SummaryPage } from "./pages/SummaryPage";
 import { BillsPage } from "./pages/BillsPage";
@@ -10,6 +11,7 @@ import { SuggestionsPage } from "./pages/SuggestionsPage";
 import { LinksPage } from "./pages/LinksPage";
 
 export default function enable(ctx: AddonContext) {
+  runMigrations();
   setContext(ctx);
 
   const sidebarItem = ctx.sidebar.addItem({

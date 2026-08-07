@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useBaseCurrency } from "../lib/useBaseCurrency";
 import { Plus, Pencil, Trash2, Zap, ChevronDown, RefreshCw, Link2, Loader2, Search, X } from "lucide-react";
 import { PageLayout } from "../components/PageLayout";
@@ -18,9 +18,26 @@ import {
   generateId,
   formatCurrency,
   advanceDateByCycle,
+  todayISO,
+  monthKey,
+  formatMonthLabel,
+  formatDayLabel,
 } from "../lib/storage";
-import { findMatches, type TransactionMatch } from "../lib/linker";
-import { saveLink, isLinked } from "../lib/linker-storage";
+import {
+  loadExpenseActivities,
+  matchAgainst,
+  MIN_SUGGEST_CONFIDENCE,
+  type ExpenseTx,
+  type MatchTarget,
+  type TransactionMatch,
+} from "../lib/linker";
+import {
+  saveLink,
+  removeLinksForEntity,
+  getLinkKeys,
+  getLinkedActivityIds,
+  linkKey,
+} from "../lib/linker-storage";
 import { getContext } from "../context";
 
 const CURRENT_PATH = "/addons/bills-and-subscriptions/bills";
@@ -31,14 +48,12 @@ const BILL_CYCLES: { value: BillingCycle; label: string }[] = [
   { value: "yearly",    label: "Yearly" },
 ];
 
-const today = () => new Date().toISOString().slice(0, 10);
-
 const BLANK_FORM = {
   name: "",
   amount: "",
   currency: "EUR" as Currency,
   category: "Electricity" as BillCategory,
-  date: today(),
+  date: todayISO(),
   website: "",
   notes: "",
   paid: false,
@@ -262,8 +277,87 @@ function BillForm({ initial, editingId, accounts, onSave, onDelete, onClose }: B
   );
 }
 
-function monthLabel(dateStr: string): string {
-  return new Date(dateStr).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+/**
+ * Everything about a bill that can change WHICH transaction matches it. The
+ * scan cache is keyed on this, so an edit to the name/amount/currency/date/
+ * account re-scans while an unrelated re-render (or flipping `paid`) does not.
+ */
+function scanSignature(bill: Bill): string {
+  return [bill.id, bill.name, bill.amount, bill.currency, bill.date, bill.accountId ?? ""].join("|");
+}
+
+/** Day-of-month from a "YYYY-MM-DD" string, without going through Date. */
+function dayOfMonth(dateStr: string): number | null {
+  const day = Number(dateStr.slice(8, 10));
+  return Number.isInteger(day) && day >= 1 && day <= 31 ? day : null;
+}
+
+/** Same recurring series: what the user would call "the same bill, next cycle". */
+function isSameSeries(a: Bill, b: Bill): boolean {
+  return a.name === b.name && a.category === b.category && a.currency === b.currency;
+}
+
+/**
+ * The day-of-month this recurring series is anchored to, so a bill due on the
+ * 31st does not walk backwards (31 Jan -> 28 Feb -> 28 Mar -> …).
+ *
+ * Clamping only ever pulls a date EARLIER, and only in months shorter than the
+ * anchor — so a day of 27 or less was never clamped and needs no recovery.
+ * When the day could be a clamp result, the largest day seen elsewhere in the
+ * series is the closest thing we have to the original anchor. Returns undefined
+ * to let advanceDateByCycle default to the bill's own day.
+ */
+function seriesAnchorDay(bill: Bill, all: Bill[]): number | undefined {
+  const day = dayOfMonth(bill.date);
+  if (day === null || day < 28) return undefined;
+  let anchor = day;
+  for (const other of all) {
+    if (other.id === bill.id || !other.recurring || !isSameSeries(bill, other)) continue;
+    const d = dayOfMonth(other.date);
+    if (d !== null && d > anchor) anchor = d;
+  }
+  return anchor > day ? anchor : undefined;
+}
+
+/**
+ * Activities already linked to a DIFFERENT entity — those must not be offered
+ * again. Activities linked to this bill are deliberately kept: the row's
+ * "already linked" state is what renders them.
+ */
+function excludeForBill(billId: string, linkedIds: Set<string>, keys: Set<string>): Set<string> {
+  const out = new Set<string>();
+  for (const activityId of linkedIds) {
+    if (!keys.has(linkKey(billId, activityId))) out.add(activityId);
+  }
+  return out;
+}
+
+function describeError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  try {
+    return String(err);
+  } catch {
+    return "unknown error";
+  }
+}
+
+/** Report through the host: a toast for the user, detail for the log. */
+function reportError(userMessage: string, err: unknown): void {
+  try {
+    const { api } = getContext();
+    api.logger.error(`[bills] ${userMessage} — ${describeError(err)}`);
+    api.toast.error(userMessage);
+  } catch {
+    // Host channels unavailable (no context yet); nothing better to do than drop it.
+  }
+}
+
+interface MonthGroup {
+  key: string;    // "2026-02" — stable, locale- and timezone-independent
+  label: string;  // "February 2026"
+  items: Bill[];
+  currencies: string[];
+  byCurrency: Record<string, number>;
 }
 
 export function BillsPage() {
@@ -283,50 +377,127 @@ export function BillsPage() {
   const [scanStatus, setScanStatus] = useState<Record<string, 'scanning' | 'done'>>({});
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
   const [pickerBill, setPickerBill] = useState<Bill | null>(null);
+  // Scan cache, keyed on scanSignature(bill) — see D3 note on that helper.
   const scannedRef = useRef<Set<string>>(new Set());
+  // Bumped on every link write so the memoised link-key set below rebuilds.
+  const [linkVersion, setLinkVersion] = useState(0);
+
+  // Declared first so it is armed before any effect that resolves async work.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   const refresh = useCallback(() => setBills(getBills()), []);
   useEffect(() => { refresh(); }, [refresh]);
+
+  /**
+   * One parse of the links array per link write, instead of one per rendered
+   * row: isLinked() re-reads and re-parses localStorage on every call.
+   */
+  const linkKeys = useMemo(() => getLinkKeys(), [linkVersion]);
 
   // Fetch active accounts once on mount
   useEffect(() => {
     getContext().api.accounts.getAll()
       .then((all: { id: string; name: string; isActive: boolean }[]) => {
+        if (!mountedRef.current) return;
         const active = all.filter(a => a.isActive);
         setAccounts(active);
         setAccountIds(active.map(a => a.id));
       })
-      .catch(() => {});
+      .catch((err: unknown) => {
+        // Silently failing here leaves matching permanently dead with no clue why.
+        reportError("Couldn't load accounts, so payment matching is unavailable.", err);
+      });
   }, []);
 
-  // Auto-scan unpaid bills when accounts are ready
+  /**
+   * Auto-scan unpaid bills. ONE activity fetch for the union of accounts, then
+   * a pure in-memory match per bill — N bills cost 1 request, not N × accounts.
+   */
   useEffect(() => {
     if (accountIds.length === 0 || bills.length === 0) return;
-    const unpaid = bills.filter(b => !b.paid);
-    for (const bill of unpaid) {
-      if (scannedRef.current.has(bill.id)) continue;
-      scannedRef.current.add(bill.id);
-      const accts = bill.accountId ? [bill.accountId] : accountIds;
-      setScanStatus(prev => ({ ...prev, [bill.id]: 'scanning' }));
-      findMatches({ name: bill.name, amount: bill.amount, currency: bill.currency }, accts)
-        .then(matches => {
-          const top = matches[0] && matches[0].confidence >= 0.25 ? matches[0] : null;
-          setSuggestions(prev => ({ ...prev, [bill.id]: top }));
-          setScanStatus(prev => ({ ...prev, [bill.id]: 'done' }));
-        })
-        .catch(() => {
-          setScanStatus(prev => ({ ...prev, [bill.id]: 'done' }));
-        });
-    }
-  }, [bills, accountIds]);
 
-  const accountMap: Record<string, string> = {};
-  for (const a of accounts) accountMap[a.id] = a.name;
-  const activeAccounts = accounts.map(a => ({ id: a.id, name: a.name }));
+    const pending = bills.filter(b => !b.paid && !scannedRef.current.has(scanSignature(b)));
+    if (pending.length === 0) return;
+    for (const bill of pending) scannedRef.current.add(scanSignature(bill));
+
+    setScanStatus(prev => {
+      const next = { ...prev };
+      for (const bill of pending) next[bill.id] = 'scanning';
+      return next;
+    });
+    // A re-scan means the bill changed, so it is a different question from the
+    // one the user dismissed.
+    setDismissed(prev => {
+      if (!pending.some(b => prev.has(b.id))) return prev;
+      const next = new Set(prev);
+      for (const bill of pending) next.delete(bill.id);
+      return next;
+    });
+
+    const settle = () => setScanStatus(prev => {
+      const next = { ...prev };
+      for (const bill of pending) next[bill.id] = 'done';
+      return next;
+    });
+
+    // Not cancelled on re-render: bills changes on every save, and cancelling
+    // would orphan bills whose signature is already marked as scanned. The
+    // mounted guard is what keeps us from writing to a dead component.
+    loadExpenseActivities(accountIds)
+      .then((activities: ExpenseTx[]) => {
+        if (!mountedRef.current) return;
+        const linkedIds = getLinkedActivityIds();
+        const keys = getLinkKeys();
+        const found: Record<string, TransactionMatch | null> = {};
+        for (const bill of pending) {
+          // A bill pinned to an account filters the shared snapshot in memory;
+          // fetching the narrower account set would be a second cache key and
+          // therefore a second full download.
+          const pool = bill.accountId
+            ? activities.filter(a => a.accountId === bill.accountId)
+            : activities;
+          const target: MatchTarget = {
+            name: bill.name,
+            amount: bill.amount,
+            currency: bill.currency,
+            date: bill.date,   // without this, date proximity stays neutral
+          };
+          const top = matchAgainst(target, pool, {
+            excludeActivityIds: excludeForBill(bill.id, linkedIds, keys),
+            limit: 1,
+          })[0];
+          found[bill.id] = top && top.confidence >= MIN_SUGGEST_CONFIDENCE ? top : null;
+        }
+        setSuggestions(prev => ({ ...prev, ...found }));
+        settle();
+      })
+      .catch((err: unknown) => {
+        // Let a failed scan be retried rather than cached as "done forever".
+        for (const bill of pending) scannedRef.current.delete(scanSignature(bill));
+        if (!mountedRef.current) return;
+        settle();
+        reportError("Couldn't scan transactions for matching payments.", err);
+      });
+  }, [bills, accountIds, linkVersion]);
+
+  const accountMap = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const a of accounts) map[a.id] = a.name;
+    return map;
+  }, [accounts]);
+
+  const activeAccounts = useMemo(
+    () => accounts.map(a => ({ id: a.id, name: a.name })),
+    [accounts],
+  );
 
   const openAdd = () => {
     setEditingId(null);
-    setFormInitial({ ...BLANK_FORM, currency: baseCurrency, date: today() });
+    setFormInitial({ ...BLANK_FORM, currency: baseCurrency, date: todayISO() });
     setShowForm(true);
   };
 
@@ -369,6 +540,10 @@ export function BillsPage() {
 
   const handleDelete = (id: string) => {
     deleteBill(id);
+    // Otherwise the links outlive the bill and keep its activities excluded
+    // from every other bill's suggestions forever.
+    removeLinksForEntity(id);
+    setLinkVersion(v => v + 1);
     refresh();
     setShowForm(false);
   };
@@ -378,9 +553,14 @@ export function BillsPage() {
     saveBill({ ...bill, paid: markingPaid });
 
     if (markingPaid && bill.recurring && bill.billingCycle) {
-      const nextDate = advanceDateByCycle(bill.date, bill.billingCycle);
-      const alreadyExists = getBills().some(
-        (b) => b.name === bill.name && b.date === nextDate && !b.paid,
+      const all = getBills();
+      // advanceDateByCycle is UTC-safe and clamps to the month length
+      // (31 Jan + 1 month = 28 Feb); anchorDay stops the series drifting.
+      const nextDate = advanceDateByCycle(bill.date, bill.billingCycle, seriesAnchorDay(bill, all));
+      // Name alone collides between two same-named bills in one cycle, so the
+      // guard is the whole identity of the occurrence we are about to create.
+      const alreadyExists = nextDate === "" || all.some(
+        (b) => b.date === nextDate && !b.paid && isSameSeries(bill, b),
       );
       if (!alreadyExists) {
         saveBill({
@@ -415,35 +595,77 @@ export function BillsPage() {
       accountName: match.accountName,
       linkedAt: new Date().toISOString(),
     });
+    setLinkVersion(v => v + 1);
+
+    // This activity is now spoken for. Any other bill still suggesting it must
+    // drop it and re-scan with it excluded.
+    const stale = Object.keys(suggestions).filter(
+      (id) => id !== bill.id && suggestions[id]?.activityId === match.activityId,
+    );
+    if (stale.length > 0) {
+      for (const id of stale) {
+        const other = bills.find(b => b.id === id);
+        if (other) scannedRef.current.delete(scanSignature(other));
+      }
+      setSuggestions(prev => {
+        const next = { ...prev };
+        for (const id of stale) next[id] = null;
+        return next;
+      });
+    }
+
     togglePaid(bill);
   };
 
-  const toggleMonth = (month: string) => {
+  const toggleMonth = (monthKeyValue: string) => {
     setCollapsedMonths((prev) => {
       const next = new Set(prev);
-      next.has(month) ? next.delete(month) : next.add(month);
+      next.has(monthKeyValue) ? next.delete(monthKeyValue) : next.add(monthKeyValue);
       return next;
     });
   };
 
-  // Sort newest first, group by month
-  const sorted = [...bills].sort((a, b) => b.date.localeCompare(a.date));
-  const grouped = sorted.reduce<{ month: string; items: Bill[] }[]>((acc, bill) => {
-    const month = monthLabel(bill.date);
-    const group = acc.find((g) => g.month === month);
-    if (group) group.items.push(bill);
-    else acc.push({ month, items: [bill] });
-    return acc;
-  }, []);
+  /**
+   * Sort newest first, group by month, total each group. Grouping is keyed on
+   * monthKey ("2026-02"), not on a localised label: `new Date("2026-02-01")`
+   * parses as UTC midnight and renders in local time, so west of Greenwich a
+   * bill dated the 1st landed in the previous month's group.
+   */
+  const grouped = useMemo<MonthGroup[]>(() => {
+    const sorted = [...bills].sort((a, b) => b.date.localeCompare(a.date));
+    const groups: MonthGroup[] = [];
+    const byKey = new Map<string, MonthGroup>();
+    for (const bill of sorted) {
+      const key = monthKey(bill.date);
+      let group = byKey.get(key);
+      if (!group) {
+        group = { key, label: formatMonthLabel(key), items: [], currencies: [], byCurrency: {} };
+        byKey.set(key, group);
+        groups.push(group);
+      }
+      group.items.push(bill);
+      group.byCurrency[bill.currency] = (group.byCurrency[bill.currency] ?? 0) + bill.amount;
+    }
+    for (const group of groups) group.currencies = Object.keys(group.byCurrency);
+    return groups;
+  }, [bills]);
 
-  // Current month banner stats
-  const currentMonth = monthLabel(today());
-  const currentMonthBills = grouped.find((g) => g.month === currentMonth)?.items ?? [];
-  const unpaidCount = currentMonthBills.filter((b) => !b.paid).length;
-  const currentByCurrency = currentMonthBills.reduce<Record<string, number>>((acc, b) => {
-    acc[b.currency] = (acc[b.currency] ?? 0) + b.amount;
-    return acc;
-  }, {});
+  // Current month banner stats. todayISO() only changes at midnight; a remount
+  // picks that up, which is what the previous render-time call did too.
+  const currentMonth = useMemo(() => {
+    const items = grouped.find((g) => g.key === monthKey(todayISO()))?.items ?? [];
+    return {
+      items,
+      unpaidCount: items.filter((b) => !b.paid).length,
+      byCurrency: items.reduce<Record<string, number>>((acc, b) => {
+        acc[b.currency] = (acc[b.currency] ?? 0) + b.amount;
+        return acc;
+      }, {}),
+    };
+  }, [grouped]);
+  const currentMonthBills = currentMonth.items;
+  const unpaidCount = currentMonth.unpaidCount;
+  const currentByCurrency = currentMonth.byCurrency;
   const currentCurrencies = Object.keys(currentByCurrency);
 
   return (
@@ -511,26 +733,22 @@ export function BillsPage() {
         )}
 
         {/* Grouped list */}
-        {grouped.map(({ month, items }) => {
-          const isOpen = !collapsedMonths.has(month);
-          const monthByCurrency = items.reduce<Record<string, number>>((acc, b) => {
-            acc[b.currency] = (acc[b.currency] ?? 0) + b.amount;
-            return acc;
-          }, {});
-          const monthCurrencies = Object.keys(monthByCurrency);
+        {grouped.map(({ key, label, items, currencies: monthCurrencies, byCurrency: monthByCurrency }) => {
+          // Collapsed state is keyed on the month key, not its localised label.
+          const isOpen = !collapsedMonths.has(key);
 
           return (
-            <div key={month} className="flex flex-col gap-1.5">
+            <div key={key} className="flex flex-col gap-1.5">
               {/* Month header */}
               <button
-                onClick={() => toggleMonth(month)}
+                onClick={() => toggleMonth(key)}
                 className="flex items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition-colors py-1 select-none w-full"
               >
                 <ChevronDown
                   className="h-3.5 w-3.5 transition-transform duration-200"
                   style={{ transform: isOpen ? "rotate(0deg)" : "rotate(-90deg)" }}
                 />
-                <span>{month}</span>
+                <span>{label}</span>
                 <span className="flex-1" />
                 <span className="tabular-nums">
                   {monthCurrencies.map((cur) => formatCurrency(monthByCurrency[cur], cur)).join(" + ")}
@@ -551,7 +769,9 @@ export function BillsPage() {
                       const bannerShown = !bill.paid
                         && suggestion != null
                         && !dismissed.has(bill.id)
-                        && !isLinked(bill.id, suggestion.activityId);
+                        // Set lookup against the memoised keys — no localStorage
+                        // read or JSON.parse per row, per render.
+                        && !linkKeys.has(linkKey(bill.id, suggestion.activityId));
                       const showSpinner = !bill.paid && scanSt === 'scanning';
                       const showSearchBtn = !bill.paid && !showSpinner && !bannerShown;
 
@@ -588,7 +808,7 @@ export function BillsPage() {
                                 )}
                               </div>
                               <span className="text-xs text-muted-foreground">
-                                {new Date(bill.date).toLocaleDateString(undefined, { day: "numeric", month: "short" })}
+                                {formatDayLabel(bill.date)}
                               </span>
                             </div>
 
@@ -686,6 +906,10 @@ export function BillsPage() {
         />
       )}
 
+      {/* The picker still fetches its own activities. Once it accepts a
+          pre-loaded snapshot, hand it the one this page already cached — for an
+          account-pinned bill the narrower accountIds below is a different cache
+          key, so it costs one extra download today. */}
       {pickerBill && (
         <TransactionPickerModal
           entityName={pickerBill.name}

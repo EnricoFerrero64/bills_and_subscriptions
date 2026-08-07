@@ -1,16 +1,83 @@
-import { useState, useEffect, useCallback } from 'react';
-import { Search, Link2, ChevronDown, ChevronUp, Loader2, Unlink, AlertCircle } from 'lucide-react';
-import { PageLayout } from '../components/PageLayout';
-import { getSubscriptions, formatCurrency, type Subscription } from '../lib/storage';
-import { findMatches, type TransactionMatch } from '../lib/linker';
-import { saveLink, removeLink, getLinksForEntity, confidenceColor, type LinkedTransaction } from '../lib/linker-storage';
-import { getContext } from '../context';
+import { useState, useEffect, useCallback, useRef } from "react";
+import { Search, Link2, ChevronDown, ChevronUp, Loader2, Unlink, AlertCircle } from "lucide-react";
+import { PageLayout } from "../components/PageLayout";
+import {
+  getSubscriptions,
+  formatCurrency,
+  formatFullDate,
+  describeError,
+  type Subscription,
+} from "../lib/storage";
+import {
+  loadExpenseActivities,
+  matchAgainst,
+  type ExpenseTx,
+  type TransactionMatch,
+} from "../lib/linker";
+import {
+  saveLink,
+  removeLink,
+  getLinksForEntity,
+  getLinkedActivityIds,
+  getLinkKeys,
+  linkKey,
+  confidenceColor,
+  type LinkedTransaction,
+} from "../lib/linker-storage";
+import { getContext } from "../context";
 
 interface MatchState {
   loading: boolean;
   done: boolean;
   matches: TransactionMatch[];
   error?: string;
+}
+
+/**
+ * Accounts are fetched once on mount. "loaded but empty" and "still loading"
+ * look identical if all we track is accountIds.length, which is what used to
+ * leave a permanent "Loading accounts…" spinner in front of anyone without an
+ * active account.
+ */
+type AccountsStatus = "loading" | "ready" | "error";
+
+/**
+ * Activities linked to a *different* bill or subscription must not be offered
+ * again, but the ones linked to *this* subscription have to stay in the list —
+ * they are what renders the "Unlink" state. Built once per subscription from
+ * two storage reads shared across the whole scan, never per candidate.
+ */
+function exclusionsForEntity(
+  entityId: string,
+  allLinkedIds: Set<string>,
+  allLinkKeys: Set<string>,
+): Set<string> {
+  const exclude = new Set<string>();
+  for (const activityId of allLinkedIds) {
+    if (!allLinkKeys.has(linkKey(entityId, activityId))) exclude.add(activityId);
+  }
+  return exclude;
+}
+
+/**
+ * Score one subscription against an already-loaded activity snapshot.
+ * matchAgainst() is pure and synchronous, so this does no IO at all.
+ */
+function computeMatches(
+  sub: Subscription,
+  activities: ExpenseTx[],
+  exclude: Set<string>,
+): TransactionMatch[] {
+  return matchAgainst(
+    // No `date` on purpose: a subscription recurs, so every historical charge
+    // is a legitimate match and there is no single date to be close to. The lib
+    // scores a missing target date as a neutral 0.5. Do NOT "fix" this by
+    // passing nextBillingDate — it would penalise older charges of the very
+    // same subscription for no reason.
+    { name: sub.name, amount: sub.amount, currency: sub.currency },
+    activities,
+    { excludeActivityIds: exclude },
+  );
 }
 
 function ConfidenceBar({ value }: { value: number }) {
@@ -36,25 +103,29 @@ interface MatchRowProps {
 }
 
 function MatchRow({ match, onToggle, linked }: MatchRowProps) {
+  const dateLabel = formatFullDate(match.activityDate);
   return (
     <div className="flex items-center gap-3 py-2 px-3 rounded-lg hover:bg-muted/50 transition-colors text-sm">
       <div className="flex flex-col gap-0.5 flex-1 min-w-0">
-        <span className="truncate text-foreground font-medium">{match.comment || '—'}</span>
-        <span className="text-xs text-muted-foreground">{match.activityDate} · {match.accountName}</span>
+        <span className="truncate text-foreground font-medium">{match.comment || "—"}</span>
+        <span className="text-xs text-muted-foreground">
+          {/* An unparseable date must not leave a dangling separator behind. */}
+          {[dateLabel, match.accountName].filter(Boolean).join(" · ")}
+        </span>
       </div>
       <span className="shrink-0 tabular-nums text-foreground">{formatCurrency(match.amount, match.currency)}</span>
       <ConfidenceBar value={match.confidence} />
       <button
         onClick={() => onToggle(match, linked)}
-        title={linked ? 'Unlink' : 'Link this transaction'}
+        title={linked ? "Unlink" : "Link this transaction"}
         className={`shrink-0 flex items-center gap-1 text-xs px-2.5 py-1 rounded-md font-medium transition-colors ${
           linked
-            ? 'bg-primary/10 text-primary hover:bg-destructive/10 hover:text-destructive'
-            : 'bg-muted text-muted-foreground hover:bg-primary/10 hover:text-primary'
+            ? "bg-primary/10 text-primary hover:bg-destructive/10 hover:text-destructive"
+            : "bg-muted text-muted-foreground hover:bg-primary/10 hover:text-primary"
         }`}
       >
         {linked ? <Unlink className="h-3 w-3" /> : <Link2 className="h-3 w-3" />}
-        {linked ? 'Unlink' : 'Link'}
+        {linked ? "Unlink" : "Link"}
       </button>
     </div>
   );
@@ -98,7 +169,7 @@ function SubCard({ sub, matchState, onScan, onToggleLink, linkSet }: SubCardProp
         {matchState?.loading ? (
           <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
         ) : matchState?.done ? (
-          <span className="text-xs text-muted-foreground shrink-0">{totalCount} match{totalCount !== 1 ? 'es' : ''}</span>
+          <span className="text-xs text-muted-foreground shrink-0">{totalCount} match{totalCount !== 1 ? "es" : ""}</span>
         ) : (
           <span className="text-xs text-primary shrink-0">Scan</span>
         )}
@@ -136,14 +207,21 @@ function SubCard({ sub, matchState, onScan, onToggleLink, linkSet }: SubCardProp
   );
 }
 
+const SCAN_ERROR_COPY = "Couldn't load your transactions. Check Wealthfolio and try again.";
+
 export function SuggestionsPage() {
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
   const [accountIds, setAccountIds] = useState<string[]>([]);
+  const [accountsStatus, setAccountsStatus] = useState<AccountsStatus>("loading");
   const [matchStates, setMatchStates] = useState<Record<string, MatchState>>({});
   const [linkSets, setLinkSets] = useState<Record<string, Set<string>>>({});
   const [scanning, setScanning] = useState(false);
+  // Fetches outlive the page (navigating away mid-scan is normal), so every
+  // setState reached from a promise callback is gated on this.
+  const mounted = useRef(true);
 
   useEffect(() => {
+    mounted.current = true;
     const subs = getSubscriptions().filter(s => s.active);
     setSubscriptions(subs);
 
@@ -155,34 +233,87 @@ export function SuggestionsPage() {
     }
     setLinkSets(initial);
 
-    getContext().api.accounts.getAll().then(accounts => {
-      setAccountIds(accounts.filter(a => a.isActive).map(a => a.id));
-    }).catch(() => {});
+    const ctx = getContext();
+    ctx.api.accounts.getAll()
+      .then(accounts => {
+        if (!mounted.current) return;
+        setAccountIds(accounts.filter(a => a.isActive).map(a => a.id));
+        setAccountsStatus("ready");
+      })
+      .catch(err => {
+        // Log even when unmounted: the failure happened and is worth a trace.
+        ctx.api.logger.error(`[bills-and-subscriptions] accounts.getAll failed: ${describeError(err)}`);
+        if (!mounted.current) return;
+        ctx.api.toast.error("Couldn't load your accounts, so transactions can't be matched.");
+        setAccountsStatus("error");
+      });
+
+    return () => { mounted.current = false; };
   }, []);
 
   const scanSub = useCallback(async (sub: Subscription) => {
     setMatchStates(prev => ({ ...prev, [sub.id]: { loading: true, done: false, matches: [] } }));
     try {
-      const matches = await findMatches(
-        { name: sub.name, amount: sub.amount, currency: sub.currency },
-        accountIds
-      );
+      // The lib caches per account set, so once anything has loaded this is a
+      // cache hit plus one in-memory pass — the per-card "Scan" is instant.
+      const activities = await loadExpenseActivities(accountIds);
+      if (!mounted.current) return;
+      const exclude = exclusionsForEntity(sub.id, getLinkedActivityIds(), getLinkKeys());
+      const matches = computeMatches(sub, activities, exclude);
       setMatchStates(prev => ({ ...prev, [sub.id]: { loading: false, done: true, matches } }));
-    } catch (e) {
+    } catch (err) {
+      getContext().api.logger.error(
+        `[bills-and-subscriptions] scan failed for "${sub.name}": ${describeError(err)}`,
+      );
+      if (!mounted.current) return;
+      // The card shows the failure; the cause went to the host log above.
       setMatchStates(prev => ({
         ...prev,
-        [sub.id]: { loading: false, done: true, matches: [], error: 'Failed to fetch transactions' },
+        [sub.id]: { loading: false, done: true, matches: [], error: SCAN_ERROR_COPY },
       }));
     }
   }, [accountIds]);
 
   const scanAll = useCallback(async () => {
+    if (subscriptions.length === 0) return;
     setScanning(true);
-    for (const sub of subscriptions) {
-      await scanSub(sub);
+    setMatchStates(prev => {
+      const next = { ...prev };
+      for (const sub of subscriptions) next[sub.id] = { loading: true, done: false, matches: [] };
+      return next;
+    });
+    try {
+      // ONE fetch for the whole page: history is loaded once here, then each
+      // subscription is scored against that snapshot in memory. This used to be
+      // N sequential full-history fetches (await per subscription in a loop).
+      const activities = await loadExpenseActivities(accountIds);
+      if (!mounted.current) return;
+      // Link bookkeeping is read once for the whole pass too, not per candidate.
+      const allLinkedIds = getLinkedActivityIds();
+      const allLinkKeys = getLinkKeys();
+      const next: Record<string, MatchState> = {};
+      for (const sub of subscriptions) {
+        const exclude = exclusionsForEntity(sub.id, allLinkedIds, allLinkKeys);
+        next[sub.id] = { loading: false, done: true, matches: computeMatches(sub, activities, exclude) };
+      }
+      setMatchStates(prev => ({ ...prev, ...next }));
+    } catch (err) {
+      const ctx = getContext();
+      ctx.api.logger.error(`[bills-and-subscriptions] Scan All failed: ${describeError(err)}`);
+      if (!mounted.current) return;
+      // Cards can be collapsed, so this one needs to reach the user directly.
+      ctx.api.toast.error(SCAN_ERROR_COPY);
+      setMatchStates(prev => {
+        const next = { ...prev };
+        for (const sub of subscriptions) {
+          next[sub.id] = { loading: false, done: true, matches: [], error: SCAN_ERROR_COPY };
+        }
+        return next;
+      });
+    } finally {
+      if (mounted.current) setScanning(false);
     }
-    setScanning(false);
-  }, [subscriptions, scanSub]);
+  }, [subscriptions, accountIds]);
 
   const handleToggleLink = useCallback((subId: string, match: TransactionMatch, currentlyLinked: boolean) => {
     if (currentlyLinked) {
@@ -195,7 +326,7 @@ export function SuggestionsPage() {
     } else {
       const link: LinkedTransaction = {
         entityId: subId,
-        entityType: 'subscription',
+        entityType: "subscription",
         activityId: match.activityId,
         activityDate: match.activityDate,
         amount: match.amount,
@@ -213,6 +344,8 @@ export function SuggestionsPage() {
     }
   }, []);
 
+  const canScan = accountsStatus === "ready" && accountIds.length > 0;
+
   return (
     <PageLayout activePath="/addons/bills-and-subscriptions/suggestions">
       <div className="p-4 flex flex-col gap-4">
@@ -227,19 +360,33 @@ export function SuggestionsPage() {
           </div>
           <button
             onClick={scanAll}
-            disabled={scanning || accountIds.length === 0}
+            disabled={scanning || !canScan}
             className="flex items-center gap-1.5 text-xs px-3 py-1.5 rounded-lg bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50 transition-opacity"
           >
             {scanning
               ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
               : <Search className="h-3.5 w-3.5" />}
-            {scanning ? 'Scanning…' : 'Scan All'}
+            {scanning ? "Scanning…" : "Scan All"}
           </button>
         </div>
 
-        {accountIds.length === 0 && (
+        {accountsStatus === "loading" && (
           <div className="flex items-center gap-2 text-xs text-muted-foreground bg-muted/40 rounded-lg px-3 py-2.5">
             <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading accounts…
+          </div>
+        )}
+
+        {accountsStatus === "ready" && accountIds.length === 0 && (
+          <div className="flex items-center gap-2 text-xs text-muted-foreground bg-muted/40 rounded-lg px-3 py-2.5">
+            <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+            No active accounts. Add or re-activate an account in Wealthfolio to match transactions.
+          </div>
+        )}
+
+        {accountsStatus === "error" && (
+          <div className="flex items-center gap-2 text-xs text-destructive bg-destructive/10 rounded-lg px-3 py-2.5">
+            <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+            Couldn't load your accounts. Reload the page to try again.
           </div>
         )}
 

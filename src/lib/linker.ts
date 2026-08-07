@@ -1,19 +1,28 @@
-import { getContext } from '../context';
+// Transaction matching: finds the real bank movement behind a bill or a
+// subscription charge.
+//
+// The design point of this module is the load/match split. Activity history is
+// fetched ONCE per account set (server-side filtered, paginated, cached) and
+// every target is then scored against that in-memory snapshot by the pure,
+// synchronous matchAgainst(). A page with N bills does 1 request, not N.
+
+import type { ActivityDetails, ActivitySearchFilters } from "@wealthfolio/addon-sdk";
+import { getContext } from "../context";
+import { ADDON_SOURCE, getSyncLog, isValidISODate } from "./storage";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-export interface DetectedPattern {
-  id: string;
-  name: string;
-  amount: number;
+/** An expense-side activity, normalised for matching. */
+export interface ExpenseTx {
+  activityId: string;
+  accountId: string;
+  accountName: string;
+  date: string;        // YYYY-MM-DD
+  amount: number;      // ALWAYS positive (host sign convention is not guaranteed)
   currency: string;
+  comment: string;     // raw, for display
   activityType: string;
-  dates: string[];
-  frequency: 'weekly' | 'monthly' | 'quarterly' | 'yearly';
-  confidence: number;
-  lastSeen: string;
-  nextExpected: string;
-  isIncome: boolean;
+  isSynthetic: boolean; // written by this addon's sync — never offer as a match
 }
 
 export interface TransactionMatch {
@@ -25,249 +34,353 @@ export interface TransactionMatch {
   currency: string;
   comment: string;
   activityType: string;
-  confidence: number;
+  confidence: number;  // 0..1
 }
 
-export interface ScanConfig {
-  enabled: boolean;
-  accountIds: string[];
-  monthsBack: number;
-  minOccurrences: number;
-  amountTolerance: number;
+export interface MatchTarget {
+  name: string;
+  amount: number;
+  currency: string;
+  date?: string;       // the bill's due date / the subscription's charge date
 }
 
-export const DEFAULT_SCAN_CONFIG: ScanConfig = {
-  enabled: true,
-  accountIds: [],
-  monthsBack: 6,
-  minOccurrences: 3,
-  amountTolerance: 0.05,
-};
+export interface MatchOptions {
+  excludeActivityIds?: Set<string>;  // e.g. activities already linked elsewhere
+  limit?: number;                    // default 25
+}
 
-// ─── Detection ───────────────────────────────────────────────────────────────
+// ─── Tuning constants ─────────────────────────────────────────────────────────
 
-export async function detectPatterns(config: ScanConfig): Promise<DetectedPattern[]> {
-  if (!config.enabled || config.accountIds.length === 0) return [];
+/** Confidence at or above which the UI may auto-suggest a match without asking. */
+export const MIN_SUGGEST_CONFIDENCE = 0.45;
 
-  const ctx = getContext();
-  const txs: Array<{date: string; amount: number; currency: string; comment: string; activityType: string}> = [];
-  for (const accountId of config.accountIds) {
-    const activities = await ctx.api.activities.getAll(accountId);
-    for (const a of activities) {
-      const d = a.date;
-      const now = new Date();
-      const start = new Date();
-      start.setMonth(start.getMonth() - config.monthsBack);
-      start.setDate(1);
-      start.setHours(0, 0, 0, 0);
-      now.setHours(0, 0, 0, 0);
-      if (d < start || d > now) continue;
-      txs.push({
-        date: d.toISOString().slice(0, 10),
-        amount: Number(a.amount),
-        currency: a.currency,
-        comment: a.comment || '',
-        activityType: a.activityType,
-      });
-    }
+/** Activity types that can represent paying a bill or a subscription. */
+const EXPENSE_TYPES = ["WITHDRAWAL", "FEE"] as const;
+
+const MAX_AMOUNT_DIFF = 0.2;   // reject beyond 20% off the expected amount
+const MIN_NAME_SIMILARITY = 0.3;
+const DATE_SCORE_WINDOW_DAYS = 45;
+const DEFAULT_LIMIT = 25;
+
+const PAGE_SIZE = 500;
+/** Hard stop so a host that ignores `page` cannot spin us forever. */
+const MAX_PAGES = 40;
+
+// ─── Activity cache ───────────────────────────────────────────────────────────
+
+/**
+ * Keyed by account set, because callers legitimately ask for different sets: a
+ * page loads the union of active accounts, while a bill pinned to one account
+ * asks for just that one. A single-entry cache turns that alternation into a
+ * 0% hit rate — each narrow request evicts the union snapshot and the next wide
+ * request re-downloads everything. Small bound: the sets in play are few.
+ */
+const MAX_CACHE_ENTRIES = 8;
+
+const cache = new Map<string, Promise<ExpenseTx[]>>();
+
+function cacheKey(accountIds: string[]): string {
+  return [...accountIds].sort().join("|");
+}
+
+/** Drop the cache — call after the addon writes activities (sync). */
+export function invalidateActivityCache(): void {
+  cache.clear();
+}
+
+/**
+ * Fetch every expense-side activity for these accounts, ONCE, and cache it.
+ * Uses activities.search() with backend-side accountIds + activityTypes
+ * filters and follows pagination. Concurrent callers with the same account set
+ * share one in-flight promise. Falls back to activities.getAll() per account if
+ * search() is unavailable or throws.
+ */
+export async function loadExpenseActivities(accountIds: string[]): Promise<ExpenseTx[]> {
+  if (accountIds.length === 0) return [];
+
+  const key = cacheKey(accountIds);
+  const cached = cache.get(key);
+  if (cached) return cached;
+
+  const promise = fetchExpenseActivities(accountIds);
+  // Evict the oldest first: Map preserves insertion order, so the first key is
+  // the least recently added.
+  if (cache.size >= MAX_CACHE_ENTRIES) {
+    const oldest = cache.keys().next();
+    if (!oldest.done) cache.delete(oldest.value);
+  }
+  cache.set(key, promise);
+  // A failed fetch must not be cached, or the page never recovers from a blip.
+  promise.catch(() => {
+    if (cache.get(key) === promise) cache.delete(key);
+  });
+  return promise;
+}
+
+async function fetchExpenseActivities(accountIds: string[]): Promise<ExpenseTx[]> {
+  const syntheticIds = getSyncedActivityIds();
+  let raw: ActivityDetails[];
+  try {
+    raw = await searchAllPages(accountIds);
+  } catch {
+    raw = await getAllPerAccount(accountIds);
   }
 
-  const patterns: DetectedPattern[] = [];
-  const groups = groupByComment(txs);
-  for (const key of groups.keys()) {
-    const txns = groups.get(key);
-    if (!txns || txns.length < config.minOccurrences) continue;
-    const clusters = clusterAmounts(txns, config.amountTolerance);
-    for (let ci = 0; ci < clusters.length; ci++) {
-      const cluster = clusters[ci];
-      if (cluster.length < config.minOccurrences) continue;
-      const sorted = cluster.sort((a, b) => a.date < b.date ? -1 : 1);
-      const dates = sorted.map(tx => tx.date);
-      const intervals = calcIntervals(dates);
-      const frequency = detectFrequency(intervals);
-      const confidence = scoreConfidence(cluster.length, intervals, frequency);
-      if (frequency && confidence >= 0.4) {
-        const lastDate = dates[dates.length - 1];
-        patterns.push({
-          id: sorted[0].date + ':' + sorted[0].amount + ':' + sorted[0].currency,
-          name: sorted[0].comment,
-          amount: sorted[0].amount,
-          currency: sorted[0].currency,
-          activityType: sorted[0].activityType,
-          dates,
-          frequency,
-          confidence,
-          lastSeen: lastDate,
-          nextExpected: predictNext(lastDate, frequency),
-          isIncome: sorted[0].activityType === 'DEPOSIT',
-        });
-      }
-    }
+  const out: ExpenseTx[] = [];
+  const seen = new Set<string>();
+  for (const a of raw) {
+    if (!isExpenseType(a.activityType)) continue;
+    if (seen.has(a.id)) continue; // paginated hosts can repeat rows across pages
+    seen.add(a.id);
+    out.push(toExpenseTx(a, syntheticIds));
   }
+  return out;
+}
 
-  return patterns.sort((a, b) => b.confidence - a.confidence);
+async function searchAllPages(accountIds: string[]): Promise<ActivityDetails[]> {
+  const api = getContext().api.activities;
+  if (typeof api.search !== "function") throw new Error("activities.search unavailable");
+
+  const filters: ActivitySearchFilters = {
+    accountIds,                          // one request covers every account
+    activityTypes: [...EXPENSE_TYPES],    // filtered by the backend, not by us
+  };
+
+  const all: ActivityDetails[] = [];
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const res = await api.search(page, PAGE_SIZE, filters, "");
+    const rows = res?.data ?? [];
+    all.push(...rows);
+    const total = res?.meta?.totalRowCount;
+    if (rows.length < PAGE_SIZE) break;
+    if (typeof total === "number" && all.length >= total) break;
+  }
+  return all;
+}
+
+async function getAllPerAccount(accountIds: string[]): Promise<ActivityDetails[]> {
+  const api = getContext().api.activities;
+  const perAccount = await Promise.all(accountIds.map((id) => api.getAll(id)));
+  return perAccount.flat();
+}
+
+/**
+ * Activity ids this addon created. Two signals, because neither alone is
+ * complete: new writes carry metadata.source, but rows synced before that
+ * stamp existed only appear in the sync log.
+ */
+function getSyncedActivityIds(): Set<string> {
+  return new Set(Object.values(getSyncLog()));
+}
+
+function isExpenseType(activityType: string): boolean {
+  return (EXPENSE_TYPES as readonly string[]).includes(activityType);
+}
+
+function isSyntheticActivity(a: ActivityDetails, syncedIds: Set<string>): boolean {
+  if (syncedIds.has(a.id)) return true;
+  const source = a.metadata?.source;
+  return typeof source === "string" && source === ADDON_SOURCE;
+}
+
+function toExpenseTx(a: ActivityDetails, syncedIds: Set<string>): ExpenseTx {
+  return {
+    activityId: a.id,
+    accountId: a.accountId,
+    accountName: a.accountName,
+    date: toISODate(a.date),
+    amount: Math.abs(Number(a.amount ?? 0)) || 0,
+    currency: a.currency,
+    comment: a.comment ?? "",
+    activityType: a.activityType,
+    isSynthetic: isSyntheticActivity(a, syncedIds),
+  };
+}
+
+/** The SDK types `date` as Date, but hosts that cross a JSON boundary hand back
+ *  an ISO string. Accept both rather than crash on toISOString. */
+function toISODate(value: Date | string): string {
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? "" : value.toISOString().slice(0, 10);
+  }
+  if (typeof value === "string") return value.slice(0, 10);
+  return "";
 }
 
 // ─── Matching ─────────────────────────────────────────────────────────────────
 
+interface ScoredMatch extends TransactionMatch {
+  dayDistance: number; // tie-breaker only, not part of the public shape
+}
+
+/** Pure and synchronous: rank `activities` against one target. */
+export function matchAgainst(
+  target: MatchTarget,
+  activities: ExpenseTx[],
+  opts?: MatchOptions,
+): TransactionMatch[] {
+  const exclude = opts?.excludeActivityIds;
+  const limit = opts?.limit ?? DEFAULT_LIMIT;
+  const targetDays = target.date && isValidISODate(target.date) ? isoToDays(target.date) : null;
+  const normalizedName = normalizeComment(target.name);
+
+  const scored: ScoredMatch[] = [];
+  for (const tx of activities) {
+    if (tx.isSynthetic) continue;
+    if (exclude?.has(tx.activityId)) continue;
+    if (tx.currency !== target.currency) continue;
+
+    const pctDiff = Math.abs(tx.amount - target.amount) / Math.max(target.amount, 0.01);
+    if (pctDiff > MAX_AMOUNT_DIFF) continue;
+
+    const ns = similarity(normalizedName, normalizeComment(tx.comment));
+    if (ns < MIN_NAME_SIMILARITY) continue;
+
+    const dayDistance =
+      targetDays !== null && isValidISODate(tx.date)
+        ? Math.abs(isoToDays(tx.date) - targetDays)
+        : 0;
+    const amountScore = 1 - Math.min(pctDiff / MAX_AMOUNT_DIFF, 1);
+    // No target date means date carries no information — stay neutral rather
+    // than penalise every candidate equally.
+    const dateScore =
+      targetDays === null ? 0.5 : Math.max(0, 1 - dayDistance / DATE_SCORE_WINDOW_DAYS);
+
+    scored.push({
+      activityId: tx.activityId,
+      accountId: tx.accountId,
+      accountName: tx.accountName,
+      activityDate: tx.date,
+      amount: tx.amount,
+      currency: tx.currency,
+      comment: tx.comment,
+      activityType: tx.activityType,
+      confidence: clamp01(0.5 * ns + 0.3 * dateScore + 0.2 * amountScore),
+      dayDistance,
+    });
+  }
+
+  scored.sort(
+    (a, b) =>
+      b.confidence - a.confidence ||
+      a.dayDistance - b.dayDistance ||
+      compareDatesDesc(a.activityDate, b.activityDate),
+  );
+
+  return scored.slice(0, Math.max(0, limit)).map(stripInternals);
+}
+
+/** Convenience: loadExpenseActivities + matchAgainst. */
 export async function findMatches(
-  target: { name: string; amount: number; currency: string; date?: string; startDate?: string },
-  accountIds: string[]
+  target: MatchTarget,
+  accountIds: string[],
+  opts?: MatchOptions,
 ): Promise<TransactionMatch[]> {
-  if (!accountIds.length) return [];
-
-  const ctx = getContext();
-  const EXPENSE_TYPES = new Set(['WITHDRAWAL', 'FEE']);
-  const matches: TransactionMatch[] = [];
-  for (const accountId of accountIds) {
-    const activities = await ctx.api.activities.getAll(accountId);
-    for (const a of activities) {
-      if (!EXPENSE_TYPES.has(a.activityType)) continue;
-      const pctDiff = Math.abs(Number(a.amount) - target.amount) / Math.max(target.amount, 0.01);
-      if (pctDiff > 0.2) continue;
-      const nameScore = commentSimilarity(target.name, a.comment || '');
-      if (nameScore < 0.1) continue;
-
-      matches.push({
-        activityId: a.id,
-        accountId: a.accountId,
-        accountName: a.accountName,
-        activityDate: a.date.toISOString().slice(0, 10),
-        amount: Number(a.amount),
-        currency: a.currency,
-        comment: a.comment || '',
-        activityType: a.activityType,
-        confidence: nameScore,
-      });
-    }
-  }
-  return matches.sort((a, b) => b.confidence - a.confidence);
+  if (accountIds.length === 0) return [];
+  return matchAgainst(target, await loadExpenseActivities(accountIds), opts);
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+function stripInternals({ dayDistance: _dayDistance, ...match }: ScoredMatch): TransactionMatch {
+  return match;
+}
 
+function compareDatesDesc(a: string, b: string): number {
+  if (a === b) return 0;
+  return a > b ? -1 : 1;
+}
+
+function clamp01(n: number): number {
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(1, Math.max(0, n));
+}
+
+const MS_PER_DAY = 86_400_000;
+
+/** Whole days since the epoch for a "YYYY-MM-DD" string, parsed as UTC so the
+ *  viewer's timezone can never shift a comparison by a day. */
+function isoToDays(iso: string): number {
+  return Date.parse(`${iso.slice(0, 10)}T00:00:00Z`) / MS_PER_DAY;
+}
+
+// ─── Comment normalisation & similarity ───────────────────────────────────────
+
+/** Tokens banks staple onto a description that say nothing about the merchant. */
+const NOISE_TOKENS = new Set([
+  "ref", "refno", "reference", "txn", "trn", "tx", "trans", "auth", "authno",
+  "id", "no", "nr", "num", "seq", "pos", "xxxx", "xx",
+]);
+
+/**
+ * Reduce a description to its alphabetic core.
+ *
+ * Real bank comments look like "NETFLIX 12/03 REF 88213" — the digits and the
+ * reference tokens change on every charge, so leaving them in means two
+ * charges for the same service never look similar. The raw comment is kept
+ * separately on ExpenseTx for display.
+ */
 function normalizeComment(comment: string): string {
-  return comment.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ').trim();
+  return comment
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")  // drop combining accents
+    .split(/[^a-z0-9]+/)
+    .filter((token) => token.length > 0 && !isNoiseToken(token))
+    .join(" ");
 }
 
-function groupByComment(
-  txns: Array<{date: string; amount: number; currency: string; comment: string; activityType: string}>
-): Map<string, Array<{date: string; amount: number; currency: string; comment: string; activityType: string}>> {
-  const groups: Map<string, Array<{date: string; amount: number; currency: string; comment: string; activityType: string}>> = new Map();
-  for (let i = 0; i < txns.length; i++) {
-    const tx = txns[i];
-    const key = normalizeComment(tx.comment);
-    const existing = groups.get(key);
-    if (existing) existing.push(tx);
-    else groups.set(key, [tx]);
-  }
-  return groups;
+function isNoiseToken(token: string): boolean {
+  if (NOISE_TOKENS.has(token)) return true;
+  if (!/[a-z]/.test(token)) return true;              // pure digits, date fragments
+  return /\d/.test(token) && token.length > 3;        // reference codes: "inv12345"
 }
 
-function clusterAmounts(
-  txns: Array<{date: string; amount: number; currency: string; comment: string; activityType: string}>,
-  tolerance: number
-): Array<Array<{date: string; amount: number; currency: string; comment: string; activityType: string}>> {
-  const sorted = [...txns].sort((a, b) => a.amount - b.amount);
-  const clusters: Array<Array<{date: string; amount: number; currency: string; comment: string; activityType: string}>> = [];
-  let current: Array<{date: string; amount: number; currency: string; comment: string; activityType: string}> = [];
-  let sum = 0;
-  let count = 0;
-  for (let i = 0; i < sorted.length; i++) {
-    const tx = sorted[i];
-    const avg = count > 0 ? sum / count : 0;
-    if (count === 0 || Math.abs(tx.amount - avg) / Math.max(avg, 0.01) <= tolerance) {
-      current.push(tx);
-      sum += tx.amount;
-      count++;
-    } else {
-      if (current.length > 0) clusters.push(current);
-      current = [tx];
-      sum = tx.amount;
-      count = 1;
-    }
-  }
-  if (current.length > 0) clusters.push(current);
-  return clusters;
-}
-
-function calcIntervals(dates: string[]): number[] {
-  const sorted = [...dates].sort();
-  const intervals: number[] = [];
-  for (let i = 1; i < sorted.length; i++) {
-    const d1 = new Date(sorted[i]);
-    const d0 = new Date(sorted[i - 1]);
-    const diff = (d1.getTime() - d0.getTime()) / (1000 * 60 * 60 * 24);
-    if (diff > 0) intervals.push(diff);
-  }
-  return intervals;
-}
-
-function detectFrequency(intervals: number[]): 'weekly' | 'monthly' | 'quarterly' | 'yearly' | null {
-  if (intervals.length < 2) return null;
-  const avg = intervals.reduce((a, b) => a + b) / intervals.length;
-  const variance = intervals.reduce((s, i) => s + Math.pow(i - avg, 2), 0) / intervals.length;
-  const cv = Math.sqrt(variance) / Math.max(avg, 1);
-  if (cv > 0.4) return null;
-  if (avg < 21) return 'weekly';
-  if (avg < 45) return 'monthly';
-  if (avg < 150) return 'quarterly';
-  return 'yearly';
-}
-
-function scoreConfidence(count: number, intervals: number[], frequency: string): number {
-  if (intervals.length < 2 || !frequency) return 0.4;
-  const avg = intervals.reduce((a, b) => a + b) / intervals.length;
-  const variance = intervals.reduce((s, i) => s + Math.pow(i - avg, 2), 0) / intervals.length;
-  const cv = Math.sqrt(variance) / Math.max(avg, 1);
-  let score = 0.4;
-  if (count >= 6) score += 0.15;
-  else if (count >= 3) score += 0.1;
-  if (cv < 0.1) score += 0.2;
-  else if (cv < 0.25) score += 0.1;
-  return Math.min(score, 0.95);
-}
-
-function predictNext(lastDate: string, frequency: 'weekly' | 'monthly' | 'quarterly' | 'yearly'): string {
-  const d = new Date(lastDate);
-  switch (frequency) {
-    case 'weekly': d.setDate(d.getDate() + 7); break;
-    case 'monthly': d.setMonth(d.getMonth() + 1); break;
-    case 'quarterly': d.setMonth(d.getMonth() + 3); break;
-    case 'yearly': d.setFullYear(d.getFullYear() + 1); break;
-  }
-  return d.toISOString().slice(0, 10);
-}
-
-function commentSimilarity(a: string, b: string): number {
-  const na = normalizeComment(a);
-  const nb = normalizeComment(b);
+/** 0..1 similarity of two already-normalised strings. */
+function similarity(na: string, nb: string): number {
   if (!na || !nb) return 0;
-  if (na === nb) return 1.0;
+  if (na === nb) return 1;
   if (na.includes(nb) || nb.includes(na)) return 0.7;
-  const longer = na.length > nb.length ? na : nb;
-  const shorter = na.length > nb.length ? nb : na;
-  const dist = levenshtein(longer, shorter);
-  return 1 - dist / longer.length;
+
+  const longer = na.length >= nb.length ? na : nb;
+  const shorter = na.length >= nb.length ? nb : na;
+  // Levenshtein is at least the length gap, so similarity can never exceed
+  // shorter/longer. Skip the DP entirely when that ceiling misses the gate.
+  const ceiling = shorter.length / longer.length;
+  if (ceiling < MIN_NAME_SIMILARITY) return 0;
+
+  const maxDist = Math.floor(longer.length * (1 - MIN_NAME_SIMILARITY));
+  const dist = levenshtein(longer, shorter, maxDist);
+  if (dist > maxDist) return 0;
+  return Math.max(0, 1 - dist / longer.length);
 }
 
-function levenshtein(a: string, b: string): number {
+/**
+ * Two-row Levenshtein: this runs over thousands of activities times N targets,
+ * so a full matrix per comparison is not affordable. Bails out with
+ * `maxDist + 1` as soon as every cell in a row exceeds maxDist.
+ */
+function levenshtein(a: string, b: string, maxDist: number): number {
   if (a.length === 0) return b.length;
   if (b.length === 0) return a.length;
-  const m = a.length;
+
   const n = b.length;
-  const dp: number[][] = [];
-  for (let i = 0; i <= m; i++) {
-    dp[i] = [];
-    for (let j = 0; j <= n; j++) dp[i][j] = 0;
-  }
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let i = 1; i <= m; i++) {
+  let prev = new Array<number>(n + 1);
+  let curr = new Array<number>(n + 1);
+  for (let j = 0; j <= n; j++) prev[j] = j;
+
+  for (let i = 1; i <= a.length; i++) {
+    curr[0] = i;
+    let rowMin = curr[0];
+    const ca = a.charCodeAt(i - 1);
     for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+      const cost = ca === b.charCodeAt(j - 1) ? 0 : 1;
+      const v = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+      curr[j] = v;
+      if (v < rowMin) rowMin = v;
     }
+    if (rowMin > maxDist) return maxDist + 1;
+    const swap = prev;
+    prev = curr;
+    curr = swap;
   }
-  return dp[m][n];
+  return prev[n];
 }
